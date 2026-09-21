@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -21,23 +23,49 @@ type TaskRepository interface {
 	Delete(ctx context.Context, ownerID, taskID string) error
 }
 
+// IdempotencyStore is the atomic persistence contract for idempotent task
+// creation (P5). It mirrors the consumer-side interface pattern: the service
+// defines what it needs, the sqlx repository implements it, so the service
+// stays unit-testable against a fake.
+//
+// LookupByKey is the fast path (read-only); a not-found or expired row returns
+// (nil, nil) — NOT an error. CreateTaskWithKey is the slow path: it inserts the
+// task and its idempotency key in ONE transaction, and on a PK (key,user_id)
+// collision returns the already-stored task with created=false (the race
+// backstop).
+type IdempotencyStore interface {
+	LookupByKey(ctx context.Context, key, userID string) (*domain.IdempotencyRecord, error)
+	CreateTaskWithKey(ctx context.Context, task *domain.Task, key string) (*domain.Task, bool, error)
+}
+
 // TaskService implements the task use-case layer. All operations are
 // owner-scoped: the authenticated user's ID is threaded into every repository
 // call so ownership is enforced at the query boundary, never in the handler.
 type TaskService struct {
 	repo   TaskRepository
+	idem   IdempotencyStore
 	logger *slog.Logger
 	now    func() time.Time
 }
 
 // NewTaskService builds a TaskService with the given repository and logger.
 // Time is injectable via the constructor for deterministic tests.
+//
+// The sqlx-backed repository satisfies BOTH TaskRepository and IdempotencyStore
+// (the atomic idempotent insert shares the same connection as the plain CRUD
+// operations), so we recover the IdempotencyStore capability from the same
+// repository object via the interface it also implements. Wiring stays in
+// main.go untouched (composition root passes a single *taskRepository).
 func NewTaskService(repo TaskRepository, logger *slog.Logger) *TaskService {
-	return &TaskService{
+	svc := &TaskService{
 		repo:   repo,
 		logger: logger,
 		now:    time.Now,
 	}
+	if idem, ok := repo.(IdempotencyStore); ok {
+		svc.idem = idem
+	}
+	return svc
 }
 
 // taskID returns a fresh v4 UUID for a new task.
@@ -46,7 +74,8 @@ func (s *TaskService) taskID() string {
 }
 
 // Create validates the input, then persists a new task owned by ownerID.
-// Idempotency is out of scope here (P5) — this is a plain insert.
+// Idempotency is handled by CreateIdempotent (P5) — this is the plain insert
+// path kept for callers that don't need a key.
 func (s *TaskService) Create(ctx context.Context, ownerID string, in domain.CreateTaskInput) (*domain.Task, error) {
 	if err := in.Validate(); err != nil {
 		return nil, err
@@ -69,6 +98,61 @@ func (s *TaskService) Create(ctx context.Context, ownerID string, in domain.Crea
 	}
 
 	return t, nil
+}
+
+// CreateIdempotent creates a task idempotently: the same (key, userID) is
+// guaranteed to produce the same task and an identical response, no matter how
+// many times the request is retried.
+//
+// Flow:
+//  1. validate input (errors short-circuit before any store call)
+//  2. FAST PATH: LookupByKey — hit (not expired) → replay the stored snapshot,
+//     created=false
+//  3. SLOW PATH: build a fresh task → IdempotencyStore.CreateTaskWithKey (one
+//     transaction: insert task + insert key) → created=true, or created=false if
+//     a concurrent writer already won the (key,user_id) race.
+//
+// The snapshot stored is json.Marshal(task) only; the handler wraps it in the
+// {"data": ...} envelope, so both paths emit byte-identical bytes.
+func (s *TaskService) CreateIdempotent(ctx context.Context, userID, idemKey string, in domain.CreateTaskInput) (*domain.Task, bool, error) {
+	if s.idem == nil {
+		return nil, false, fmt.Errorf("idempotent create: idempotency store not configured")
+	}
+
+	if err := in.Validate(); err != nil {
+		return nil, false, err
+	}
+
+	// FAST PATH — read-only replay.
+	rec, err := s.idem.LookupByKey(ctx, idemKey, userID)
+	if err != nil {
+		return nil, false, fmt.Errorf("idempotent create: %w", err)
+	}
+	if rec != nil && rec.ExpiresAt.After(s.now()) {
+		var t domain.Task
+		if err := json.Unmarshal([]byte(rec.ResponseBody), &t); err != nil {
+			return nil, false, fmt.Errorf("idempotent create: decode snapshot: %w", err)
+		}
+		return &t, false, nil // REPLAY
+	}
+
+	// SLOW PATH — atomic insert via the store.
+	now := s.now().UTC()
+	task := &domain.Task{
+		ID:          s.taskID(),
+		OwnerID:     userID,
+		Title:       in.Title,
+		Description: in.Description,
+		Status:      domain.TaskStatusTodo,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+
+	createdTask, created, err := s.idem.CreateTaskWithKey(ctx, task, idemKey)
+	if err != nil {
+		return nil, false, fmt.Errorf("idempotent create: %w", err)
+	}
+	return createdTask, created, nil
 }
 
 // Get returns one task owned by ownerID, or domain.ErrNotFound.

@@ -26,6 +26,7 @@ const (
 	codeForbidden    = "FORBIDDEN"
 	codeInternal     = "INTERNAL_ERROR"
 	codeEmailTaken   = "EMAIL_TAKEN"
+	codeInvalidIdemKey = "INVALID_IDEMPOTENCY_KEY"
 )
 
 // errInfo maps a sentinel (or arbitrary) error to an HTTP status + client code.
@@ -44,6 +45,9 @@ func NewErrorHandler(env string) fiber.ErrorHandler {
 		info := classify(err)
 
 		code := codeForStatus(info.status)
+		if errors.Is(err, domain.ErrInvalidIdempotencyKey) {
+			code = codeInvalidIdemKey
+		}
 		message := info.message
 		if prod && info.status >= 500 {
 			// Never leak internal detail in production.
@@ -74,6 +78,8 @@ func classify(err error) errInfo {
 		return errInfo{status: fiber.StatusNotFound, message: domain.ErrNotFound.Error()}
 	case errors.Is(err, domain.ErrEmailTaken):
 		return errInfo{status: fiber.StatusConflict, message: domain.ErrEmailTaken.Error()}
+	case errors.Is(err, domain.ErrInvalidIdempotencyKey):
+		return errInfo{status: fiber.StatusBadRequest, message: domain.ErrInvalidIdempotencyKey.Error()}
 	case errors.Is(err, domain.ErrInternal):
 		return errInfo{status: fiber.StatusInternalServerError, message: domain.ErrInternal.Error()}
 	default:

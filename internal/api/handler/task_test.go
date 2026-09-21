@@ -8,8 +8,10 @@ import (
 	"log/slog"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 
 	"github.com/wandyirawan/task-manager-api/internal/api"
 	"github.com/wandyirawan/task-manager-api/internal/api/handler"
@@ -19,12 +21,16 @@ import (
 
 // handlerFakeRepo is a tiny in-memory TaskRepository used to back the real
 // service so the handler test exercises the whole parse→service→respond path.
+// It also implements service.IdempotencyStore so the production
+// NewTaskService wiring (which recovers the IdempotencyStore from the same repo
+// object) is exercised here too.
 type handlerFakeRepo struct {
 	tasks map[string]*domain.Task
+	keys  map[string]*domain.IdempotencyRecord
 }
 
 func newHandlerFakeRepo() *handlerFakeRepo {
-	return &handlerFakeRepo{tasks: map[string]*domain.Task{}}
+	return &handlerFakeRepo{tasks: map[string]*domain.Task{}, keys: map[string]*domain.IdempotencyRecord{}}
 }
 
 func (r *handlerFakeRepo) Create(ctx context.Context, task *domain.Task) error {
@@ -83,6 +89,48 @@ func (r *handlerFakeRepo) Delete(ctx context.Context, ownerID, taskID string) er
 	return nil
 }
 
+// LookupByKey implements service.IdempotencyStore: read-only fetch, expired →
+// treated as not-found.
+func (r *handlerFakeRepo) LookupByKey(ctx context.Context, key, userID string) (*domain.IdempotencyRecord, error) {
+	rec, ok := r.keys[userID+"|"+key]
+	if !ok {
+		return nil, nil
+	}
+	if rec.ExpiresAt.Before(time.Now()) {
+		return nil, nil
+	}
+	return rec, nil
+}
+
+// CreateTaskWithKey implements service.IdempotencyStore: atomic-feeling in
+// memory insert of task + snapshot, with a UNIQUE (key,userID) race backstop.
+func (r *handlerFakeRepo) CreateTaskWithKey(ctx context.Context, task *domain.Task, key string) (*domain.Task, bool, error) {
+	k := task.OwnerID + "|" + key
+	if existing, ok := r.keys[k]; ok {
+		var t domain.Task
+		if err := json.Unmarshal([]byte(existing.ResponseBody), &t); err != nil {
+			return nil, false, err
+		}
+		return &t, false, nil
+	}
+	body, err := json.Marshal(task)
+	if err != nil {
+		return nil, false, err
+	}
+	cpy := *task
+	r.tasks[task.ID] = &cpy
+	r.keys[k] = &domain.IdempotencyRecord{
+		Key:            key,
+		UserID:         task.OwnerID,
+		TaskID:         task.ID,
+		ResponseStatus: 201,
+		ResponseBody:   string(body),
+		CreatedAt:      time.Now(),
+		ExpiresAt:      time.Now().Add(24 * time.Hour),
+	}
+	return &cpy, true, nil
+}
+
 type nopWriter struct{}
 
 func (nopWriter) Write(p []byte) (int, error) { return len(p), nil }
@@ -110,10 +158,15 @@ func newHandlerApp(t *testing.T, userID string) *fiber.App {
 	return app
 }
 
-func doReq(t *testing.T, app *fiber.App, method, path, body string) (int, []byte) {
+// doReq issues a request. headers is a variadic list of [name, value] pairs
+// (e.g. an Idempotency-Key header).
+func doReq(t *testing.T, app *fiber.App, method, path, body string, headers ...[2]string) (int, []byte) {
 	t.Helper()
 	req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
+	for _, h := range headers {
+		req.Header.Set(h[0], h[1])
+	}
 	resp, err := app.Test(req)
 	if err != nil {
 		t.Fatalf("app.Test: %v", err)
@@ -136,10 +189,13 @@ func decode(t *testing.T, data []byte, out any) {
 	}
 }
 
+// createTask posts a task with a fresh idempotency key and returns the created
+// task. Every POST /tasks now requires an Idempotency-Key header (P5).
 func createTask(t *testing.T, app *fiber.App) *domain.Task {
 	t.Helper()
 	_, data := doReq(t, app, "POST", "/tasks",
-		`{"title":"Write docs","description":"s2"}`)
+		`{"title":"Write docs","description":"s2"}`,
+		[2]string{"Idempotency-Key", uuid.NewString()})
 	var env struct {
 		Data domain.Task `json:"data"`
 	}
@@ -154,7 +210,8 @@ func TestCreateTask(t *testing.T) {
 	app := newHandlerApp(t, "user-42")
 
 	status, _ := doReq(t, app, "POST", "/tasks",
-		`{"title":"Write docs","description":"s1"}`)
+		`{"title":"Write docs","description":"s1"}`,
+		[2]string{"Idempotency-Key", uuid.NewString()})
 	if status != fiber.StatusCreated {
 		t.Errorf("status = %d, want 201", status)
 	}
@@ -164,7 +221,9 @@ func TestCreateTask(t *testing.T) {
 func TestCreateValidationBadRequest(t *testing.T) {
 	app := newHandlerApp(t, "user-42")
 
-	status, data := doReq(t, app, "POST", "/tasks", `{"title":""}`)
+	// Valid idempotency key first so we actually reach the validation check.
+	status, data := doReq(t, app, "POST", "/tasks", `{"title":""}`,
+		[2]string{"Idempotency-Key", uuid.NewString()})
 	if status != fiber.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (body %s)", status, data)
 	}
@@ -304,5 +363,102 @@ func TestNoUserIDUnauthorized(t *testing.T) {
 	decode(t, data, &errResp)
 	if errResp.Code != "UNAUTHORIZED" {
 		t.Errorf("code = %q, want UNAUTHORIZED", errResp.Code)
+	}
+}
+
+// --- P5 idempotency handler tests ---
+
+func TestCreateMissingIdempotencyKey(t *testing.T) {
+	app := newHandlerApp(t, "user-42")
+
+	status, data := doReq(t, app, "POST", "/tasks", `{"title":"x"}`)
+	if status != fiber.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body %s)", status, data)
+	}
+	var errResp struct {
+		Code string `json:"code"`
+	}
+	decode(t, data, &errResp)
+	if errResp.Code != "INVALID_IDEMPOTENCY_KEY" {
+		t.Errorf("code = %q, want INVALID_IDEMPOTENCY_KEY", errResp.Code)
+	}
+}
+
+func TestCreateInvalidIdempotencyKey(t *testing.T) {
+	app := newHandlerApp(t, "user-42")
+
+	// Non-UUID key → 400 INVALID_IDEMPOTENCY_KEY (strict, no body hash).
+	status, data := doReq(t, app, "POST", "/tasks", `{"title":"x"}`,
+		[2]string{"Idempotency-Key", "abc"})
+	if status != fiber.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body %s)", status, data)
+	}
+	var errResp struct {
+		Code string `json:"code"`
+	}
+	decode(t, data, &errResp)
+	if errResp.Code != "INVALID_IDEMPOTENCY_KEY" {
+		t.Errorf("code = %q, want INVALID_IDEMPOTENCY_KEY", errResp.Code)
+	}
+}
+
+func TestCreateValidIdempotencyKey(t *testing.T) {
+	app := newHandlerApp(t, "user-42")
+
+	key := uuid.NewString()
+	status, data := doReq(t, app, "POST", "/tasks", `{"title":"docs","description":"d"}`,
+		[2]string{"Idempotency-Key", key})
+	if status != fiber.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body %s)", status, data)
+	}
+	var env struct {
+		Data domain.Task `json:"data"`
+	}
+	decode(t, data, &env)
+	if env.Data.ID == "" || env.Data.Title != "docs" {
+		t.Errorf("unexpected task: %+v (body %s)", env.Data, data)
+	}
+}
+
+func TestCreateReplayIdenticalBody(t *testing.T) {
+	app := newHandlerApp(t, "user-42")
+
+	key := uuid.NewString()
+	_, first := doReq(t, app, "POST", "/tasks", `{"title":"replay me","description":"d"}`,
+		[2]string{"Idempotency-Key", key})
+	_, second := doReq(t, app, "POST", "/tasks", `{"title":"replay me","description":"d"}`,
+		[2]string{"Idempotency-Key", key})
+
+	// Replay must be byte-for-byte identical to the original response.
+	if string(first) != string(second) {
+		t.Errorf("replay body not identical:\n first=%s\nsecond=%s", first, second)
+	}
+}
+
+func TestCreateReplayAfterMutation(t *testing.T) {
+	app := newHandlerApp(t, "user-42")
+
+	key := uuid.NewString()
+	_, first := doReq(t, app, "POST", "/tasks", `{"title":"snapshot","description":"d"}`,
+		[2]string{"Idempotency-Key", key})
+
+	var env struct {
+		Data domain.Task `json:"data"`
+	}
+	decode(t, first, &env)
+	taskID := env.Data.ID
+
+	// Mutate the task via PUT.
+	if status, _ := doReq(t, app, "PUT", "/tasks/"+taskID, `{"status":"done"}`); status != fiber.StatusOK {
+		t.Fatalf("PUT status = %d, want 200", status)
+	}
+
+	// Replay the SAME idempotency key → body must equal the ORIGINAL snapshot,
+	// proving it replays the stored snapshot, not a re-query.
+	_, replay := doReq(t, app, "POST", "/tasks", `{"title":"snapshot","description":"d"}`,
+		[2]string{"Idempotency-Key", key})
+	if string(first) != string(replay) {
+		t.Errorf("replay after mutation differs from original snapshot:\n orig=%s\nreplay=%s",
+			first, replay)
 	}
 }

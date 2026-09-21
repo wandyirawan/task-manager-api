@@ -30,7 +30,7 @@ func (r *userRepository) Create(ctx context.Context, u *domain.User) error {
 	if err != nil {
 		// email is UNIQUE — translate the driver's constraint violation into a
 		// domain sentinel so the service/handler can map it to a 409.
-		if isUniqueViolation(err) {
+		if strings.Contains(strings.ToLower(err.Error()), "unique constraint") {
 			return domain.ErrEmailTaken
 		}
 		return err
@@ -67,10 +67,4 @@ func (r *userRepository) GetByID(ctx context.Context, id string) (*domain.User, 
 		return nil, err
 	}
 	return &u, nil
-}
-
-// isUniqueViolation reports whether err is the driver's UNIQUE constraint
-// violation (surfaced by modernc.org/sqlite as a constraint message).
-func isUniqueViolation(err error) bool {
-	return err != nil && strings.Contains(strings.ToLower(err.Error()), "unique constraint")
 }

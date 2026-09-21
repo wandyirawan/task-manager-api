@@ -15,6 +15,9 @@ type fakeRepo struct {
 	createFn func(ctx context.Context, task *domain.Task) error
 	// update applies only non-nil fields to mirror the real repo.
 	updateFn func(ownerID, taskID string, in domain.UpdateTaskInput) (*domain.Task, error)
+	// idempotency fakes
+	lookupFn        func(key, userID string) (*domain.IdempotencyRecord, error)
+	createWithKeyFn func(task *domain.Task, key string) (*domain.Task, bool, error)
 }
 
 func (f *fakeRepo) seed(t *domain.Task) { f.tasks = append(f.tasks, *t) }
@@ -82,6 +85,24 @@ func (f *fakeRepo) Delete(ctx context.Context, ownerID, taskID string) error {
 		}
 	}
 	return domain.ErrNotFound
+}
+
+// LookupByKey implements service.IdempotencyStore (fast path).
+func (f *fakeRepo) LookupByKey(ctx context.Context, key, userID string) (*domain.IdempotencyRecord, error) {
+	if f.lookupFn != nil {
+		return f.lookupFn(key, userID)
+	}
+	return nil, nil
+}
+
+// CreateTaskWithKey implements service.IdempotencyStore (slow path).
+func (f *fakeRepo) CreateTaskWithKey(ctx context.Context, task *domain.Task, key string) (*domain.Task, bool, error) {
+	if f.createWithKeyFn != nil {
+		return f.createWithKeyFn(task, key)
+	}
+	cpy := *task
+	f.tasks = append(f.tasks, cpy)
+	return &cpy, true, nil
 }
 
 func newService(repo TaskRepository) *TaskService {

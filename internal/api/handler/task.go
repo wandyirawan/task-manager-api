@@ -1,10 +1,12 @@
 package handler
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 
 	"github.com/wandyirawan/task-manager-api/internal/domain"
 	"github.com/wandyirawan/task-manager-api/internal/service"
@@ -49,10 +51,14 @@ func userID(c fiber.Ctx) (string, error) {
 
 // Create godoc
 // @Summary      Create task
-// @Description  Create a new task owned by the authenticated user.
+// @Description  Create a new task owned by the authenticated user. Idempotent:
+// the Idempotency-Key header (a UUID v4) guarantees the same request replayed
+// returns the identical 201 response. Missing or non-UUID key → 400
+// INVALID_IDEMPOTENCY_KEY.
 // @Tags         tasks
 // @Accept       json
 // @Produce      json
+// @Param        Idempotency-Key header string true "Idempotency key (UUID v4)"
 // @Param        task body domain.CreateTaskInput true "Task payload"
 // @Success      201 {object} map[string]interface{}
 // @Failure      400 {object} api.ErrorResponse
@@ -63,17 +69,39 @@ func (h *TaskHandler) Create(c fiber.Ctx) error {
 		return err
 	}
 
+	// Idempotency-Key is mandatory and MUST be a UUID v4 (strict — no body hash).
+	key := c.Get("Idempotency-Key")
+	if key == "" {
+		return domain.ErrInvalidIdempotencyKey
+	}
+	if _, err := uuid.Parse(key); err != nil {
+		return domain.ErrInvalidIdempotencyKey
+	}
+
 	var in domain.CreateTaskInput
 	if err := c.Bind().JSON(&in); err != nil {
 		return fmt.Errorf("%w: %v", domain.ErrValidation, err)
 	}
 
-	task, err := h.svc.Create(c.Context(), ownerID, in)
+	task, _, err := h.svc.CreateIdempotent(c.Context(), ownerID, key, in)
 	if err != nil {
 		return err
 	}
 
-	return c.Status(fiber.StatusCreated).JSON(fiber.Map{"data": task})
+	// Marshal the task once, then wrap it in the {"data": ...} envelope with the
+	// SAME code on both the fresh and replay paths so the bytes are identical.
+	raw, err := json.Marshal(task)
+	if err != nil {
+		return fmt.Errorf("idempotent create marshal: %w", err)
+	}
+	envelope, err := json.Marshal(struct {
+		Data json.RawMessage `json:"data"`
+	}{Data: raw})
+	if err != nil {
+		return fmt.Errorf("idempotent create envelope: %w", err)
+	}
+
+	return c.Status(fiber.StatusCreated).Send(envelope)
 }
 
 // Get godoc

@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"strings"
 	"time"
 
@@ -13,6 +14,24 @@ import (
 )
 
 var _ service.TaskRepository = (*taskRepository)(nil)
+
+// idempotencyTTL is the replay window for an idempotency key (SPEC §5: 24h,
+// matching the JWT window). Hardcoded here; computed in Go (not SQL) so the
+// expiry is deterministic for tests.
+const idempotencyTTL = 24 * time.Hour
+
+// idemInsert is the row shape for the idempotency_keys insert. Kept as a
+// dedicated struct (rather than *domain.Task) because the columns differ from
+// the tasks table and we control the snapshot body explicitly.
+type idemInsert struct {
+	Key            string    `db:"key"`
+	UserID         string    `db:"user_id"`
+	TaskID         string    `db:"task_id"`
+	ResponseStatus int       `db:"response_status"`
+	ResponseBody   string    `db:"response_body"`
+	CreatedAt      time.Time `db:"created_at"`
+	ExpiresAt      time.Time `db:"expires_at"`
+}
 
 type taskRepository struct {
 	db *sqlx.DB
@@ -32,6 +51,132 @@ func (r *taskRepository) Create(ctx context.Context, task *domain.Task) error {
 		return err
 	}
 	return nil
+}
+
+// LookupByKey is the idempotency FAST PATH: a read-only fetch of a stored key
+// for (key, userID). A not-found or already-expired row returns (nil, nil) —
+// NOT an error — so the caller falls through to the slow path. Expiry is
+// checked in Go (rec.ExpiresAt) rather than in SQL to avoid any SQLite
+// datetime-format ambiguity.
+func (r *taskRepository) LookupByKey(ctx context.Context, key, userID string) (*domain.IdempotencyRecord, error) {
+	var rec domain.IdempotencyRecord
+	err := r.db.GetContext(ctx, &rec,
+		`SELECT key, user_id, task_id, response_status, response_body, created_at, expires_at
+		   FROM idempotency_keys WHERE key = ? AND user_id = ?`, key, userID)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if rec.ExpiresAt.Before(time.Now().UTC()) {
+		// Expired: treat as not-found so a fresh request creates a new task.
+		return nil, nil
+	}
+	return &rec, nil
+}
+
+// CreateTaskWithKey is the idempotency SLOW PATH. The task and its idempotency
+// key are inserted in ONE transaction (sqlx Beginx + deferred Rollback +
+// explicit Commit), with lazy cleanup of this user's expired keys in the same
+// transaction. The PK (key, user_id) UNIQUE constraint is the race backstop:
+// if two requests race, the loser's key insert hits the constraint, the
+// transaction rolls back (no zombie task), and we replay the winner's already
+// committed snapshot with created=false.
+func (r *taskRepository) CreateTaskWithKey(ctx context.Context, task *domain.Task, key string) (*domain.Task, bool, error) {
+	// BEGIN IMMEDIATE via a dedicated *sql.Conn: acquire the SQLite write
+	// lock AT BEGIN, not at the first INSERT. With a deferred BEGIN + bounded
+	// pool, concurrent writers can each hold a read-locked connection while
+	// waiting for the write lock — a self-made deadlock that surfaces as
+	// SQLITE_BUSY after busy_timeout. IMMEDIATE serializes writers at BEGIN;
+	// losers wait on busy_timeout (5s via DSN) and then take the replay path.
+	// All statements (and COMMIT) must run on the SAME connection — that is
+	// why we grab a single conn and drive raw SQL over it.
+	conn, err := r.db.Conn(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return nil, false, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK")
+		}
+	}()
+
+	now := time.Now().UTC()
+
+	// Lazy cleanup of expired keys for this user, inside the same transaction.
+	if _, err := conn.ExecContext(ctx,
+		`DELETE FROM idempotency_keys WHERE user_id = ? AND expires_at < ?`,
+		task.OwnerID, now); err != nil {
+		return nil, false, err
+	}
+
+	// 1. Insert the task.
+	if _, err := conn.ExecContext(ctx,
+		`INSERT INTO tasks (id, owner_id, assignee_id, title, description, status, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		task.ID, task.OwnerID, task.AssigneeID, task.Title, task.Description, task.Status, task.CreatedAt, task.UpdatedAt); err != nil {
+		return nil, false, err
+	}
+
+	// 2. Snapshot the task (json.Marshal(task) only) and insert the key.
+	body, err := json.Marshal(task)
+	if err != nil {
+		return nil, false, err
+	}
+
+	if _, err := conn.ExecContext(ctx,
+		`INSERT INTO idempotency_keys
+		   (key, user_id, task_id, response_status, response_body, created_at, expires_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		key, task.OwnerID, task.ID, 201, string(body), now, now.Add(idempotencyTTL)); err != nil {
+		if isUniqueViolation(err) {
+			// Race backstop: a concurrent writer already committed this key.
+			// Our ROLLBACK (deferred) undoes our own task insert, then we
+			// replay the committed snapshot.
+			return r.replayByKey(ctx, key, task.OwnerID)
+		}
+		return nil, false, err
+	}
+
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return nil, false, err
+	}
+	committed = true
+	return task, true, nil
+}
+
+// isUniqueViolation reports whether err is a SQLite UNIQUE constraint failure.
+// Shared by user.go (email UNIQUE) and task.go (idempotency PK backstop).
+func isUniqueViolation(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "unique constraint")
+}
+
+// replayByKey re-reads an already-committed idempotency key and decodes its
+// stored snapshot. Used after a UNIQUE violation so callers get the original
+// task rather than an error.
+func (r *taskRepository) replayByKey(ctx context.Context, key, userID string) (*domain.Task, bool, error) {
+	var rec domain.IdempotencyRecord
+	err := r.db.GetContext(ctx, &rec,
+		`SELECT key, user_id, task_id, response_status, response_body, created_at, expires_at
+		   FROM idempotency_keys WHERE key = ? AND user_id = ?`, key, userID)
+	if err == sql.ErrNoRows {
+		return nil, false, domain.ErrNotFound
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	var t domain.Task
+	if err := json.Unmarshal([]byte(rec.ResponseBody), &t); err != nil {
+		return nil, false, err
+	}
+	return &t, false, nil
 }
 
 func (r *taskRepository) GetByID(ctx context.Context, ownerID, taskID string) (*domain.Task, error) {

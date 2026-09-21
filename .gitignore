@@ -1,0 +1,31 @@
+# === INTERNAL working files — JANGAN PERNAH commit/push ===
+AGENTS.md
+PROGRESS.md
+SPEC.md
+*.docx
+
+# === secrets & env ===
+.env
+.env.local
+.env.*.local
+
+# === Go build artifacts ===
+/bin/
+*.exe
+*.test
+*.out
+coverage.*
+*.prof
+
+# === local database files ===
+*.db
+*.db-wal
+*.db-shm
+/data/
+
+# === OS / editor ===
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

@@ -1,0 +1,26 @@
+# ===== VCS =====
+.git
+.gitignore
+
+# ===== internal (jangan bawa ke build context) =====
+AGENTS.md
+PROGRESS.md
+SPEC.md
+*.docx
+
+# ===== secrets / env =====
+.env
+.env.*.local
+
+# ===== build artifacts & local data =====
+/data/
+/bin/
+*.db
+*.db-wal
+*.db-shm
+
+# ===== docs =====
+README.md
+
+# ===== tests (jangan di-complie di image) =====
+internal/**/*_test.go

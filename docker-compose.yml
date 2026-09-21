@@ -1,0 +1,28 @@
+# docker compose up --build        (dev)
+# Copia .env.example → .env dulu biar env vars ter-read.
+services:
+  api:
+    build: .
+    image: task-manager-api
+    ports:
+      # host port dari PORT env (default 8080) → container 8080
+      - "${PORT:-8080}:8080"
+    env_file: .env
+    environment:
+      # DB persistence di host volume
+      DB_PATH: /data/tasks.db
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # healthcheck: aktifkan setelah /healthz ada (P4)
+    # healthcheck:
+    #   test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+    #   interval: 30s
+    #   timeout: 5s
+    #   retries: 3
+    #   start_period: 5s

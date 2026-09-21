@@ -2,7 +2,6 @@ package config
 
 import (
 	"errors"
-	"os"
 
 	"github.com/caarlos0/env/v11"
 )
@@ -36,7 +35,7 @@ func New() (*Config, error) {
 
 // Load parses env vars and validates. Returns error on missing required fields.
 func (c *Config) load() error {
-	if _, err := env.Parse(c); err != nil {
+	if err := env.Parse(c); err != nil {
 		return err
 	}
 

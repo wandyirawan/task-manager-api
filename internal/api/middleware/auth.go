@@ -21,8 +21,7 @@ const (
 // error shape stays consistent with every other error; no ad-hoc response.
 //
 // Place after RequestID and RequestLogger, before handler registration.
-func Protected(secret string) fiber.Handler {
-	svc := infra.NewJWTService(secret, 0)
+func Protected(svc *infra.JWTService) fiber.Handler {
 
 	return func(c fiber.Ctx) error {
 		header := c.Get(fiberHeaderAuthorization)

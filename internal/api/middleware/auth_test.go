@@ -21,7 +21,7 @@ func authApp(handler fiber.Handler) *fiber.App {
 	app := fiber.New(fiber.Config{
 		ErrorHandler: api.NewErrorHandler("dev"),
 	})
-	app.Use(middleware.Protected(authTestSecret))
+	app.Use(middleware.Protected(infra.NewJWTService(authTestSecret, time.Hour)))
 	app.Get("/protected", handler)
 	return app
 }

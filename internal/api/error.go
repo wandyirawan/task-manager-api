@@ -25,6 +25,7 @@ const (
 	codeNotFound     = "TASK_NOT_FOUND"
 	codeForbidden    = "FORBIDDEN"
 	codeInternal     = "INTERNAL_ERROR"
+	codeEmailTaken   = "EMAIL_TAKEN"
 )
 
 // errInfo maps a sentinel (or arbitrary) error to an HTTP status + client code.
@@ -71,6 +72,8 @@ func classify(err error) errInfo {
 		return errInfo{status: fiber.StatusUnauthorized, message: domain.ErrUnauthorized.Error()}
 	case errors.Is(err, domain.ErrNotFound):
 		return errInfo{status: fiber.StatusNotFound, message: domain.ErrNotFound.Error()}
+	case errors.Is(err, domain.ErrEmailTaken):
+		return errInfo{status: fiber.StatusConflict, message: domain.ErrEmailTaken.Error()}
 	case errors.Is(err, domain.ErrInternal):
 		return errInfo{status: fiber.StatusInternalServerError, message: domain.ErrInternal.Error()}
 	default:
@@ -97,6 +100,8 @@ func codeForStatus(status int) string {
 		return codeForbidden
 	case fiber.StatusNotFound:
 		return codeNotFound
+	case fiber.StatusConflict:
+		return codeEmailTaken
 	default:
 		return codeInternal
 	}

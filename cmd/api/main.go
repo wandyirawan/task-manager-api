@@ -52,6 +52,10 @@ func main() {
 	taskSvc := service.NewTaskService(repository.NewTaskRepository(db), logger)
 	taskHandler := handler.NewTaskHandler(taskSvc)
 
+	// Public auth: register/login (SPEC §7) — no auth middleware required.
+	authSvc := service.NewAuthService(repository.NewUserRepository(db), jwtSvc, logger)
+	authHandler := handler.NewAuthHandler(authSvc)
+
 	// --- fiber app + middleware chain (SPEC §9: request_id → logging → recovery; auth per group) ---
 	app := fiber.New(fiber.Config{
 		ErrorHandler: api.NewErrorHandler(cfg.Env),
@@ -63,6 +67,9 @@ func main() {
 	app.Get("/healthz", func(c fiber.Ctx) error {
 		return c.SendString("ok")
 	})
+
+	// Public auth routes on the app directly, before the protected /tasks group.
+	handler.RegisterAuthRoutes(app, authHandler)
 
 	// Protected task routes (P3 middleware injects user_id → P4 handler reads it).
 	protected := app.Group("/tasks", middleware.Protected(jwtSvc))

@@ -1,4 +1,19 @@
-.PHONY: run build test vet tidy migrate-up migrate-down
+.PHONY: run build test vet tidy \
+        docker-build docker-push deploy run-prod run-prod-down \
+        migrate-up migrate-down
+
+# ---- image / registry config ----
+IMAGE    ?= task-manager-api
+TAG      ?= latest
+REGISTRY ?=
+
+# ---- database / migrations ----
+# Connection string used by the golang-migrate CLI (PostgreSQL).
+DB_URL ?= postgres://tm_user:tm_pass@localhost:5432/tmapi?sslmode=disable
+
+# Prefer the migrate CLI on PATH; fall back to GOPATH/bin (installed via
+# `go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest`).
+MIGRATE ?= $(shell command -v migrate 2>/dev/null || echo "$(shell go env GOPATH)/bin/migrate")
 
 run:
 	PORT=8080 \
@@ -18,8 +33,31 @@ vet:
 tidy:
 	go mod tidy
 
+# ---- docker / deploy ----
+docker-build:
+	docker build -t $(IMAGE):$(TAG) .
+
+docker-push:
+	@if [ -z "$(REGISTRY)" ]; then \
+		echo "REGISTRY is empty — skipping docker push (set REGISTRY=host/user to push)"; \
+	else \
+		docker tag $(IMAGE):$(TAG) $(REGISTRY)/$(IMAGE):$(TAG) && \
+		docker push $(REGISTRY)/$(IMAGE):$(TAG); \
+	fi
+
+# deploy = build + push the image (NOT run).
+deploy: docker-build docker-push
+
+# run-prod brings up the full API + Postgres stack via compose.
+run-prod:
+	docker compose up -d --build
+
+run-prod-down:
+	docker compose down
+
+# ---- migrations (manual / external DB; the binary auto-migrates at boot) ----
 migrate-up:
-	migrate -path migrations -database "$(shell python3 -c \"import os; print('file://' + os.path.expanduser(os.environ.get('DB_PATH', './data/tasks.db')))\" 2>/dev/null || echo 'file://./data/tasks.db')" up
+	$(MIGRATE) -path migrations -database "$(DB_URL)" up
 
 migrate-down:
-	migrate -path migrations -database "$(shell python3 -c \"import os; print('file://' + os.path.expanduser(os.environ.get('DB_PATH', './data/tasks.db')))\" 2>/dev/null || echo 'file://./data/tasks.db')" down
+	$(MIGRATE) -path migrations -database "$(DB_URL)" down

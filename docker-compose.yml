@@ -1,28 +1,42 @@
 # docker compose up --build        (dev)
-# Copia .env.example → .env dulu biar env vars ter-read.
+# Copy .env.example → .env first so env vars are read by the api service.
 services:
   api:
     build: .
     image: task-manager-api
     ports:
-      # host port dari PORT env (default 8080) → container 8080
+      # host port from PORT env (default 8080) → container 8080
       - "${PORT:-8080}:8080"
     env_file: .env
-    environment:
-      # DB persistence di host volume
-      DB_PATH: /data/tasks.db
-    volumes:
-      - ./data:/data
+    depends_on:
+      db:
+        condition: service_healthy
     restart: unless-stopped
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
-    # healthcheck: aktifkan setelah /healthz ada (P4)
-    # healthcheck:
-    #   test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
-    #   interval: 30s
-    #   timeout: 5s
-    #   retries: 3
-    #   start_period: 5s
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: tm_user
+      POSTGRES_PASSWORD: tm_pass
+      POSTGRES_DB: tmapi
+    ports:
+      # expose to the host so the Go test suite (TEST_DB_URL=localhost:5432)
+      # and local `make migrate-*` can reach it; the api service uses the
+      # `db` service name internally.
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tm_user -d tmapi"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  pgdata:

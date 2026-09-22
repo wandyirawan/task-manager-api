@@ -1,4 +1,4 @@
-.PHONY: run build test vet tidy \
+.PHONY: run build test vet tidy setup check-env \
         docker-build docker-push deploy run-prod run-prod-down \
         migrate-up migrate-down
 
@@ -14,6 +14,26 @@ DB_URL ?= postgres://tm_user:tm_pass@localhost:5432/tmapi?sslmode=disable
 # Prefer the migrate CLI on PATH; fall back to GOPATH/bin (installed via
 # `go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest`).
 MIGRATE ?= $(shell command -v migrate 2>/dev/null || echo "$(shell go env GOPATH)/bin/migrate")
+
+# ---- prerequisites ----------------------------------------------------------
+# setup installs the local tooling this project needs. Docker Compose is the
+# supported path for the database itself, so the only hard Go-side extra is
+# the migrate CLI (and only if you plan to run migrations against an external
+# database — the binary auto-migrates at boot anyway).
+setup:
+	@echo "==> Checking prerequisites..."
+	@command -v go >/dev/null || { echo "MISSING: Go 1.27+ — https://go.dev/dl/"; exit 1; }
+	@command -v docker >/dev/null || { echo "MISSING: Docker — https://docs.docker.com/get-docker/"; exit 1; }
+	@echo "==> go:      $$(go version)"
+	@echo "==> docker:  $$(docker --version | cut -d' ' -f1-3)"
+	@if command -v migrate >/dev/null || [ -x "$(MIGRATE)" ]; then \
+		echo "==> migrate: $$(migrate --version 2>/dev/null || echo "$(MIGRATE)")"; \
+	else \
+		echo "==> migrate: not found — installing via go install..."; \
+		go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest; \
+		echo "==> migrate: installed to $(shell go env GOPATH)/bin/migrate"; \
+	fi
+	@echo "==> done. Next: cp .env.example .env, edit JWT_SECRET, then make run-prod"
 
 run:
 	PORT=8080 \

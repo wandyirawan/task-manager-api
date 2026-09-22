@@ -1,0 +1,305 @@
+basePath: /
+definitions:
+  github_com_wandyirawan_task-manager-api_internal_domain.CreateTaskInput:
+    properties:
+      description:
+        type: string
+      ownerId:
+        type: string
+      title:
+        type: string
+    type: object
+  github_com_wandyirawan_task-manager-api_internal_domain.RegisterInput:
+    properties:
+      email:
+        type: string
+      password:
+        type: string
+    type: object
+  github_com_wandyirawan_task-manager-api_internal_domain.TaskStatus:
+    enum:
+    - todo
+    - in_progress
+    - done
+    type: string
+    x-enum-varnames:
+    - TaskStatusTodo
+    - TaskStatusInProgress
+    - TaskStatusDone
+  github_com_wandyirawan_task-manager-api_internal_domain.UpdateTaskInput:
+    properties:
+      description:
+        type: string
+      status:
+        $ref: '#/definitions/github_com_wandyirawan_task-manager-api_internal_domain.TaskStatus'
+      title:
+        type: string
+    type: object
+  internal_api_handler.AssignRequest:
+    properties:
+      assigneeId:
+        type: string
+    type: object
+  internal_api_handler.ErrorResp:
+    properties:
+      code:
+        type: string
+      message:
+        type: string
+      status:
+        type: integer
+      timestamp:
+        type: string
+    type: object
+host: localhost:8080
+info:
+  contact: {}
+  description: REST API for multi-user task management with JWT auth, CRUD, assignment,
+    and idempotent creates.
+  title: Task Manager API
+  version: "1.0"
+paths:
+  /login:
+    post:
+      consumes:
+      - application/json
+      description: Verify credentials and return a signed JWT.
+      parameters:
+      - description: Login payload
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/github_com_wandyirawan_task-manager-api_internal_domain.RegisterInput'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/internal_api_handler.ErrorResp'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/internal_api_handler.ErrorResp'
+      summary: Log in
+      tags:
+      - auth
+  /register:
+    post:
+      consumes:
+      - application/json
+      description: Create an account and return a signed JWT for immediate use.
+      parameters:
+      - description: Registration payload
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/github_com_wandyirawan_task-manager-api_internal_domain.RegisterInput'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/internal_api_handler.ErrorResp'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/internal_api_handler.ErrorResp'
+      summary: Register a new user
+      tags:
+      - auth
+  /tasks:
+    get:
+      description: List the authenticated user's tasks with optional status
+      parameters:
+      - description: Filter by status
+        in: query
+        name: status
+        type: string
+      - description: Title search term
+        in: query
+        name: search
+        type: string
+      - description: Page number (>=1)
+        in: query
+        name: page
+        type: integer
+      - description: Page size (1-100)
+        in: query
+        name: limit
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+      summary: List tasks
+      tags:
+      - tasks
+    post:
+      consumes:
+      - application/json
+      description: 'Create a new task owned by the authenticated user. Idempotent:'
+      parameters:
+      - description: Idempotency key (UUID v4)
+        in: header
+        name: Idempotency-Key
+        required: true
+        type: string
+      - description: Task payload
+        in: body
+        name: task
+        required: true
+        schema:
+          $ref: '#/definitions/github_com_wandyirawan_task-manager-api_internal_domain.CreateTaskInput'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/internal_api_handler.ErrorResp'
+      summary: Create task
+      tags:
+      - tasks
+  /tasks/{id}:
+    delete:
+      description: Delete a task owned by the authenticated user.
+      parameters:
+      - description: Task ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "204":
+          description: No Content
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/internal_api_handler.ErrorResp'
+      summary: Delete task
+      tags:
+      - tasks
+    get:
+      description: Get one task owned by the authenticated user.
+      parameters:
+      - description: Task ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/internal_api_handler.ErrorResp'
+      summary: Get task
+      tags:
+      - tasks
+    put:
+      consumes:
+      - application/json
+      description: Partially update title, description, and/or status of a task.
+      parameters:
+      - description: Task ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Task patch
+        in: body
+        name: task
+        required: true
+        schema:
+          $ref: '#/definitions/github_com_wandyirawan_task-manager-api_internal_domain.UpdateTaskInput'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/internal_api_handler.ErrorResp'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/internal_api_handler.ErrorResp'
+      summary: Update task
+      tags:
+      - tasks
+  /tasks/{id}/assign:
+    post:
+      consumes:
+      - application/json
+      description: Assign this task to another user. The caller must be the task
+      parameters:
+      - description: Task ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Assignee ID
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/internal_api_handler.AssignRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/internal_api_handler.ErrorResp'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/internal_api_handler.ErrorResp'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/internal_api_handler.ErrorResp'
+      summary: Assign task
+      tags:
+      - tasks
+swagger: "2.0"

@@ -1,15 +1,19 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/gofiber/contrib/v3/swaggo"
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/wandyirawan/task-manager-api/internal/api"
+	_ "github.com/wandyirawan/task-manager-api/internal/api/docs"
 	"github.com/wandyirawan/task-manager-api/internal/api/handler"
 	"github.com/wandyirawan/task-manager-api/internal/api/middleware"
 	"github.com/wandyirawan/task-manager-api/internal/config"
@@ -20,6 +24,23 @@ import (
 
 const tokenTTL = 24 * time.Hour // SPEC §7 — nyambung ke window idempotency 24 jam
 
+// logNotifier just records assignment notifications via slog. It's safe to use
+// in production; failures don't undo the assignment.
+type logNotifier struct {
+	logger *slog.Logger
+}
+
+func (n logNotifier) Notify(ctx context.Context, taskID, assigneeID, actorID string) error {
+	n.logger.Info("notification sent", "task_id", taskID, "assignee", assigneeID, "actor", actorID)
+	return nil
+}
+
+// godoc
+// @title          Task Manager API
+// @description    REST API for multi-user task management with JWT auth, CRUD, assignment, and idempotent creates.
+// @version        1.0
+// @host           localhost:8080
+// @BasePath       /
 func main() {
 	cfg, err := config.New()
 	if err != nil {
@@ -48,8 +69,10 @@ func main() {
 
 	jwtSvc := infra.NewJWTService(cfg.JWTSecret, tokenTTL)
 
+	notf := logNotifier{logger: logger}
+
 	// --- handlers & services ---
-	taskSvc := service.NewTaskService(repository.NewTaskRepository(db), logger)
+	taskSvc := service.NewTaskService(repository.NewTaskRepository(db), logger, notf)
 	taskHandler := handler.NewTaskHandler(taskSvc)
 
 	// Public auth: register/login (SPEC §7) — no auth middleware required.
@@ -68,10 +91,14 @@ func main() {
 		return c.SendString("ok")
 	})
 
+	// Swagger UI — catches all paths under /swagger/ and serves the docs page,
+	// the generated spec.json, and static assets from swaggo/files.
+	app.Use("/swagger/*", swaggo.New(swaggo.Config{InstanceName: "swagger"}))
+
 	// Public auth routes on the app directly, before the protected /tasks group.
 	handler.RegisterAuthRoutes(app, authHandler)
 
-	// Protected task routes (P3 middleware injects user_id → P4 handler reads it).
+	// Protected task routes (P3 middleware injects user_id → P4/P6 handler reads it).
 	protected := app.Group("/tasks", middleware.Protected(jwtSvc))
 	handler.RegisterRoutes(protected, taskHandler)
 

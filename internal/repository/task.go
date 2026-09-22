@@ -4,9 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgerrcode"
 	"github.com/jmoiron/sqlx"
 
 	"github.com/wandyirawan/task-manager-api/internal/domain"
@@ -56,13 +60,13 @@ func (r *taskRepository) Create(ctx context.Context, task *domain.Task) error {
 // LookupByKey is the idempotency FAST PATH: a read-only fetch of a stored key
 // for (key, userID). A not-found or already-expired row returns (nil, nil) —
 // NOT an error — so the caller falls through to the slow path. Expiry is
-// checked in Go (rec.ExpiresAt) rather than in SQL to avoid any SQLite
-// datetime-format ambiguity.
+// checked in Go (rec.ExpiresAt) rather than in SQL to keep the comparison
+// deterministic across drivers.
 func (r *taskRepository) LookupByKey(ctx context.Context, key, userID string) (*domain.IdempotencyRecord, error) {
 	var rec domain.IdempotencyRecord
 	err := r.db.GetContext(ctx, &rec,
 		`SELECT key, user_id, task_id, response_status, response_body, created_at, expires_at
-		   FROM idempotency_keys WHERE key = ? AND user_id = ?`, key, userID)
+		   FROM idempotency_keys WHERE key = $1 AND user_id = $2`, key, userID)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -76,86 +80,134 @@ func (r *taskRepository) LookupByKey(ctx context.Context, key, userID string) (*
 	return &rec, nil
 }
 
-// CreateTaskWithKey is the idempotency SLOW PATH. The task and its idempotency
-// key are inserted in ONE transaction (sqlx Beginx + deferred Rollback +
-// explicit Commit), with lazy cleanup of this user's expired keys in the same
-// transaction. The PK (key, user_id) UNIQUE constraint is the race backstop:
-// if two requests race, the loser's key insert hits the constraint, the
-// transaction rolls back (no zombie task), and we replay the winner's already
-// committed snapshot with created=false.
+// isBusy reports whether err is a transient PostgreSQL serialization failure
+// (SQLSTATE 40001) or deadlock (40P01) — both safe to retry. Shared across
+// idempotency, assign, and any future tx-writes that may hit contention under
+// MVCC.
+func isBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == pgerrcode.SerializationFailure ||
+			pgErr.Code == pgerrcode.DeadlockDetected
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "could not serialize access") ||
+		strings.Contains(msg, "serialization_failure") ||
+		strings.Contains(msg, "deadlock detected")
+}
+
+const maxRetries = 5
+
+// CreateTaskWithKey is the idempotency SLOW PATH.  The task and its
+// idempotency key are inserted in ONE transaction with lazy cleanup of
+// expired keys in the same tx. The PK (key, user_id) UNIQUE constraint is
+// the race backstop: if two goroutines race, the loser gets the UNIQUE
+// violation, rolls back cleanly, and replays the winner's snapshot.
+//
+// Retry: transient serialization/deadlock errors are retried with exponential
+// back-off (see maxRetries / sleepBackOff).  Permanent failures (UNIQUE
+// collision, FK/integrity violations, etc.) are short-circuited immediately.
 func (r *taskRepository) CreateTaskWithKey(ctx context.Context, task *domain.Task, key string) (*domain.Task, bool, error) {
-	// BEGIN IMMEDIATE via a dedicated *sql.Conn: acquire the SQLite write
-	// lock AT BEGIN, not at the first INSERT. With a deferred BEGIN + bounded
-	// pool, concurrent writers can each hold a read-locked connection while
-	// waiting for the write lock — a self-made deadlock that surfaces as
-	// SQLITE_BUSY after busy_timeout. IMMEDIATE serializes writers at BEGIN;
-	// losers wait on busy_timeout (5s via DSN) and then take the replay path.
-	// All statements (and COMMIT) must run on the SAME connection — that is
-	// why we grab a single conn and drive raw SQL over it.
-	conn, err := r.db.Conn(ctx)
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			sleepBackOff(attempt) // wait before retrying a transient conflict
+		}
+		t, created, err := r.doTx(ctx, task, key)
+		if err != nil {
+			if isBusy(err) {
+				continue // retry
+			}
+			return nil, false, err // non-retryable → return immediately
+		}
+		return t, created, nil
+	}
+	return nil, false, fmt.Errorf("idempotent create: %w after %d retries", domain.ErrInternal, maxRetries)
+}
+
+// doTx executes one attempt: opens a transaction, runs the lazy-delete + task
+// insert + key-insert + commit chain. On a UNIQUE violation it rolls back and
+// replays the already-stored snapshot so the caller gets the original task.
+func (r *taskRepository) doTx(ctx context.Context, task *domain.Task, key string) (*domain.Task, bool, error) {
+	tx, err := r.db.Beginx()
 	if err != nil {
 		return nil, false, err
 	}
-	defer conn.Close()
-
-	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
-		return nil, false, err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_, _ = conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK")
-		}
-	}()
+	// Rollback is a no-op once Commit succeeds; it cleans up on any error path.
+	defer tx.Rollback() //nolint:errcheck
 
 	now := time.Now().UTC()
 
 	// Lazy cleanup of expired keys for this user, inside the same transaction.
-	if _, err := conn.ExecContext(ctx,
-		`DELETE FROM idempotency_keys WHERE user_id = ? AND expires_at < ?`,
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM idempotency_keys WHERE user_id = $1 AND expires_at < $2`,
 		task.OwnerID, now); err != nil {
 		return nil, false, err
 	}
 
-	// 1. Insert the task.
-	if _, err := conn.ExecContext(ctx,
+	// 1. Insert the task (FK task_id→tasks means this must come before the key).
+	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO tasks (id, owner_id, assignee_id, title, description, status, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
 		task.ID, task.OwnerID, task.AssigneeID, task.Title, task.Description, task.Status, task.CreatedAt, task.UpdatedAt); err != nil {
-		return nil, false, err
-	}
-
-	// 2. Snapshot the task (json.Marshal(task) only) and insert the key.
-	body, err := json.Marshal(task)
-	if err != nil {
-		return nil, false, err
-	}
-
-	if _, err := conn.ExecContext(ctx,
-		`INSERT INTO idempotency_keys
-		   (key, user_id, task_id, response_status, response_body, created_at, expires_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		key, task.OwnerID, task.ID, 201, string(body), now, now.Add(idempotencyTTL)); err != nil {
 		if isUniqueViolation(err) {
-			// Race backstop: a concurrent writer already committed this key.
-			// Our ROLLBACK (deferred) undoes our own task insert, then we
-			// replay the committed snapshot.
+			// A prior call with the same key/user_id already wrote this task.
+			// Our rollback (deferred) cleans everything; replay the stored snapshot.
 			return r.replayByKey(ctx, key, task.OwnerID)
 		}
 		return nil, false, err
 	}
 
-	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+	// 2. Snapshot + insert idempotency key. UNIQUE on (key, user_id) is the
+	// race backstop: if two goroutines race, the loser hits this constraint,
+	// rolls back (no orphan key or task), and replays.
+	body, err := json.Marshal(task)
+	if err != nil {
 		return nil, false, err
 	}
-	committed = true
+
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO idempotency_keys
+		   (key, user_id, task_id, response_status, response_body, created_at, expires_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		key, task.OwnerID, task.ID, 201, string(body), now, now.Add(idempotencyTTL)); err != nil {
+		if isUniqueViolation(err) {
+			// Concurrent writer won this key already — replay their snapshot.
+			return r.replayByKey(ctx, key, task.OwnerID)
+		}
+		return nil, false, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, false, err
+	}
 	return task, true, nil
 }
 
-// isUniqueViolation reports whether err is a SQLite UNIQUE constraint failure.
-// Shared by user.go (email UNIQUE) and task.go (idempotency PK backstop).
+// sleepBackOff pauses for an exponential-backoff duration based on attempt count.
+func sleepBackOff(attempt int) {
+	d := time.Duration(100*(1<<uint(attempt))) * time.Millisecond
+	if d > 1*time.Second {
+		d = 1 * time.Second
+	}
+	time.Sleep(d)
+}
+
+// isUniqueViolation reports whether err is a PostgreSQL UNIQUE violation
+// (SQLSTATE 23505). Shared by user.go (email UNIQUE) and task.go (idempotency
+// PK backstop).
 func isUniqueViolation(err error) bool {
-	return err != nil && strings.Contains(strings.ToLower(err.Error()), "unique constraint")
+	if err == nil {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == pgerrcode.UniqueViolation
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unique violation") || strings.Contains(msg, "23505")
 }
 
 // replayByKey re-reads an already-committed idempotency key and decodes its
@@ -165,7 +217,7 @@ func (r *taskRepository) replayByKey(ctx context.Context, key, userID string) (*
 	var rec domain.IdempotencyRecord
 	err := r.db.GetContext(ctx, &rec,
 		`SELECT key, user_id, task_id, response_status, response_body, created_at, expires_at
-		   FROM idempotency_keys WHERE key = ? AND user_id = ?`, key, userID)
+		   FROM idempotency_keys WHERE key = $1 AND user_id = $2`, key, userID)
 	if err == sql.ErrNoRows {
 		return nil, false, domain.ErrNotFound
 	}
@@ -183,7 +235,7 @@ func (r *taskRepository) GetByID(ctx context.Context, ownerID, taskID string) (*
 	var t domain.Task
 	err := r.db.GetContext(ctx, &t,
 		`SELECT id, owner_id, assignee_id, title, description, status, created_at, updated_at
-		 FROM tasks WHERE id = ? AND owner_id = ?`, taskID, ownerID)
+		 FROM tasks WHERE id = $1 AND owner_id = $2`, taskID, ownerID)
 	if err == sql.ErrNoRows {
 		return nil, domain.ErrNotFound
 	}
@@ -193,8 +245,9 @@ func (r *taskRepository) GetByID(ctx context.Context, ownerID, taskID string) (*
 	return &t, nil
 }
 
-// escapeLike escapes the SQLite LIKE wildcards so user search terms are
-// matched literally while the surrounding % performs the partial match.
+// escapeLike escapes the LIKE wildcards so user search terms are matched
+// literally while the surrounding % performs the partial match. The explicit
+// ESCAPE '\' in the query tells Postgres which character is the escape.
 func escapeLike(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, `%`, `\%`)
@@ -204,16 +257,18 @@ func escapeLike(s string) string {
 
 // listWhere builds the shared WHERE clause + args for List. The same clause
 // drives both the row query and the COUNT so pagination meta is consistent.
+// Placeholder numbers are assigned positionally ($1, $2, …) because Postgres
+// requires explicit ordinal placeholders (no `?`).
 func listWhere(f domain.TaskFilter) (string, []any) {
-	conds := []string{"owner_id = ?"}
+	conds := []string{"owner_id = $1"}
 	args := []any{f.OwnerID}
 
 	if f.Status.Valid() {
-		conds = append(conds, "status = ?")
+		conds = append(conds, fmt.Sprintf("status = $%d", len(args)+1))
 		args = append(args, string(f.Status))
 	}
 	if f.Search != "" {
-		conds = append(conds, "title LIKE ? ESCAPE '\\'")
+		conds = append(conds, fmt.Sprintf("title LIKE $%d ESCAPE '\\'", len(args)+1))
 		args = append(args, "%"+escapeLike(f.Search)+"%")
 	}
 
@@ -230,9 +285,12 @@ func (r *taskRepository) List(ctx context.Context, f domain.TaskFilter) ([]domai
 	}
 
 	offset := (f.Page - 1) * f.Limit
+	// LIMIT/OFFSET placeholders follow the WHERE args positionally.
+	limitPos := len(args) + 1
+	offsetPos := len(args) + 2
 	query := "SELECT id, owner_id, assignee_id, title, description, status, created_at, updated_at" +
 		" FROM tasks WHERE " + where +
-		" ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+		fmt.Sprintf(" ORDER BY created_at DESC, id DESC LIMIT $%d OFFSET $%d", limitPos, offsetPos)
 	rowsArgs := append(args, f.Limit, offset)
 
 	tasks := []domain.Task{}
@@ -244,25 +302,30 @@ func (r *taskRepository) List(ctx context.Context, f domain.TaskFilter) ([]domai
 }
 
 func (r *taskRepository) Update(ctx context.Context, ownerID, taskID string, in domain.UpdateTaskInput) (*domain.Task, error) {
-	sets := []string{"updated_at = ?"}
+	sets := []string{"updated_at = $1"}
 	args := []any{time.Now().UTC()}
 
 	if in.Title != nil {
-		sets = append(sets, "title = ?")
+		sets = append(sets, fmt.Sprintf("title = $%d", len(args)+1))
 		args = append(args, *in.Title)
 	}
 	if in.Description != nil {
-		sets = append(sets, "description = ?")
+		sets = append(sets, fmt.Sprintf("description = $%d", len(args)+1))
 		args = append(args, *in.Description)
 	}
 	if in.Status != nil {
-		sets = append(sets, "status = ?")
+		sets = append(sets, fmt.Sprintf("status = $%d", len(args)+1))
 		args = append(args, string(*in.Status))
 	}
+
+	// WHERE id = $N AND owner_id = $N+1 follow the SET args.
+	idPos := len(args) + 1
+	ownerPos := len(args) + 2
 	args = append(args, taskID, ownerID)
 
 	res, err := r.db.ExecContext(ctx,
-		"UPDATE tasks SET "+strings.Join(sets, ", ")+" WHERE id = ? AND owner_id = ?", args...)
+		fmt.Sprintf("UPDATE tasks SET %s WHERE id = $%d AND owner_id = $%d",
+			strings.Join(sets, ", "), idPos, ownerPos), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -279,7 +342,7 @@ func (r *taskRepository) Update(ctx context.Context, ownerID, taskID string, in 
 	var t domain.Task
 	err = r.db.GetContext(ctx, &t,
 		`SELECT id, owner_id, assignee_id, title, description, status, created_at, updated_at
-		 FROM tasks WHERE id = ? AND owner_id = ?`, taskID, ownerID)
+		 FROM tasks WHERE id = $1 AND owner_id = $2`, taskID, ownerID)
 	if err == sql.ErrNoRows {
 		return nil, domain.ErrNotFound
 	}
@@ -291,7 +354,7 @@ func (r *taskRepository) Update(ctx context.Context, ownerID, taskID string, in 
 
 func (r *taskRepository) Delete(ctx context.Context, ownerID, taskID string) error {
 	res, err := r.db.ExecContext(ctx,
-		"DELETE FROM tasks WHERE id = ? AND owner_id = ?", taskID, ownerID)
+		"DELETE FROM tasks WHERE id = $1 AND owner_id = $2", taskID, ownerID)
 	if err != nil {
 		return err
 	}

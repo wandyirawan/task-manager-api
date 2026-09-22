@@ -3,7 +3,6 @@ package repository
 import (
 	"context"
 	"database/sql"
-	"strings"
 
 	"github.com/jmoiron/sqlx"
 
@@ -30,7 +29,7 @@ func (r *userRepository) Create(ctx context.Context, u *domain.User) error {
 	if err != nil {
 		// email is UNIQUE — translate the driver's constraint violation into a
 		// domain sentinel so the service/handler can map it to a 409.
-		if strings.Contains(strings.ToLower(err.Error()), "unique constraint") {
+		if isUniqueViolation(err) {
 			return domain.ErrEmailTaken
 		}
 		return err
@@ -45,7 +44,7 @@ func (r *userRepository) GetByEmail(ctx context.Context, email string) (*domain.
 	var u domain.User
 	err := r.db.GetContext(ctx, &u,
 		`SELECT id, email, password_hash, created_at, updated_at
-		 FROM users WHERE email = ?`, email)
+		 FROM users WHERE email = $1`, email)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -59,7 +58,7 @@ func (r *userRepository) GetByID(ctx context.Context, id string) (*domain.User, 
 	var u domain.User
 	err := r.db.GetContext(ctx, &u,
 		`SELECT id, email, password_hash, created_at, updated_at
-		 FROM users WHERE id = ?`, id)
+		 FROM users WHERE id = $1`, id)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

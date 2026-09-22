@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // TaskStatus is the lifecycle state of a task.
@@ -61,6 +63,19 @@ func (in CreateTaskInput) Validate() error {
 	}
 	if len(in.Description) > maxDescriptionLength {
 		return fmt.Errorf("%w: description must be at most %d characters", ErrValidation, maxDescriptionLength)
+	}
+	return nil
+}
+
+// AssignTaskInput carries the payload for assigning a task to someone else.
+type AssignTaskInput struct {
+	AssigneeID string `json:"assigneeId"`
+}
+
+// Validate makes sure we got a valid UUID as assignee ID.
+func (in AssignTaskInput) Validate() error {
+	if _, err := uuid.Parse(in.AssigneeID); err != nil {
+		return fmt.Errorf("%w: invalid assignee ID", ErrValidation)
 	}
 	return nil
 }

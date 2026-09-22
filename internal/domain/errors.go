@@ -6,6 +6,7 @@ import "errors"
 var (
 	ErrNotFound      = errors.New("resource not found")
 	ErrUnauthorized  = errors.New("unauthorized")
+	ErrForbidden     = errors.New("forbidden")
 	ErrValidation    = errors.New("validation failed")
 	ErrInternal      = errors.New("internal server error")
 	ErrTokenExpired  = errors.New("token expired")

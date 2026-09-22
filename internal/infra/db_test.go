@@ -2,80 +2,142 @@ package infra_test
 
 import (
 	"context"
+	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
+	"time"
 
 	"github.com/golang-migrate/migrate/v4"
-	sqliteMigrate "github.com/golang-migrate/migrate/v4/database/sqlite"
-	_ "github.com/golang-migrate/migrate/v4/source/file" // registers "file" source driver
+	postgres "github.com/golang-migrate/migrate/v4/database/postgres"
+	_ "github.com/golang-migrate/migrate/v4/source/file"
+
 	"github.com/jmoiron/sqlx"
 
 	"github.com/wandyirawan/task-manager-api/internal/config"
 	"github.com/wandyirawan/task-manager-api/internal/infra"
 )
 
-func testConfig(dir, name string) *config.Config {
-	return &config.Config{
-		DBPath:         filepath.Join(dir, name),
+// adminDB is the always-present maintenance database used to issue
+// CREATE/DROP DATABASE for the throwaway test database.
+const adminDB = "postgres"
+
+var (
+	infraTestDB    *sqlx.DB
+	infraTestName  string
+	infraTestReady bool
+	infraTestErr   error
+)
+
+func TestMain(m *testing.M) {
+	os.Exit(runInfraTests(m))
+}
+
+func runInfraTests(m *testing.M) int {
+	infraTestDB, infraTestName, infraTestErr = setupInfraTestDB()
+	infraTestReady = infraTestErr == nil
+	if !infraTestReady {
+		fmt.Fprintln(os.Stderr, "TEST_DB_URL unreachable, infra tests will skip:", infraTestErr)
+	}
+	code := m.Run()
+	if infraTestReady {
+		if infraTestDB != nil {
+			infraTestDB.Close()
+		}
+		dropInfraTestDB(infraTestName)
+	}
+	return code
+}
+
+func testDBURL() string {
+	if v := os.Getenv("TEST_DB_URL"); v != "" {
+		return v
+	}
+	return "postgres://tm_user:tm_pass@localhost:5432/tmapi_test?sslmode=disable"
+}
+
+// swapDBName rewrites the database component of a postgres:// DSN.
+func swapDBName(dsn, name string) string {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return dsn
+	}
+	u.Path = "/" + name
+	return u.String()
+}
+
+func setupInfraTestDB() (*sqlx.DB, string, error) {
+	base := testDBURL()
+
+	adm, err := sqlx.Connect("pgx", swapDBName(base, adminDB))
+	if err != nil {
+		return nil, "", err
+	}
+	defer adm.Close()
+
+	name := fmt.Sprintf("tmapi_infra_test_%d_%d", os.Getpid(), time.Now().UnixNano())
+	if _, err := adm.ExecContext(context.Background(), `CREATE DATABASE "`+name+`"`); err != nil {
+		return nil, "", err
+	}
+
+	cfg := &config.Config{
+		DBURL:          swapDBName(base, name),
 		DBMaxOpenConns: 4,
 		DBMaxIdleConns: 4,
 	}
-}
-
-func TestNewDB(t *testing.T) {
-	cfg := testConfig(t.TempDir(), "test.db")
-
 	db, err := infra.NewDB(cfg)
 	if err != nil {
-		t.Fatalf("NewDB failed: %v", err)
+		dropDBVia(adm, name)
+		return nil, "", err
 	}
-	defer db.Close()
 
-	if err := db.Ping(); err != nil {
-		t.Fatalf("db.Ping() failed: %v", err)
+	if err := migrateUp(db); err != nil {
+		db.Close()
+		dropDBVia(adm, name)
+		return nil, "", err
 	}
+	return db, name, nil
 }
 
-func TestPRAGMAsViaDSN(t *testing.T) {
-	cfg := testConfig(t.TempDir(), "pragma_test.db")
-
-	db, err := infra.NewDB(cfg)
+func dropInfraTestDB(name string) {
+	if name == "" {
+		return
+	}
+	adm, err := sqlx.Connect("pgx", swapDBName(testDBURL(), adminDB))
 	if err != nil {
-		t.Fatalf("NewDB failed: %v", err)
+		return
 	}
-	defer db.Close()
-
-	// foreign_keys pragma must be ON via DSN.
-	var fk int
-	err = db.GetContext(context.Background(), &fk, "PRAGMA foreign_keys")
-	if err != nil {
-		t.Fatalf("query PRAGMA foreign_keys: %v", err)
-	}
-	if fk != 1 {
-		t.Errorf("foreign_keys = %d, want 1", fk)
-	}
-
-	// WAL journal mode must be active.
-	var mode string
-	err = db.GetContext(context.Background(), &mode, "PRAGMA journal_mode")
-	if err != nil {
-		t.Fatalf("query PRAGMA journal_mode: %v", err)
-	}
-	if !strings.Contains(strings.ToLower(mode), "wal") {
-		t.Errorf("journal_mode = %q, want wal", mode)
-	}
+	defer adm.Close()
+	dropDBVia(adm, name)
 }
 
-func findMigrationsDir(t *testing.T) string {
-	t.Helper()
+func dropDBVia(adm *sqlx.DB, name string) {
+	_, _ = adm.ExecContext(context.Background(), `DROP DATABASE "`+name+`" WITH (FORCE)`)
+}
+
+// migrateUp applies the real golang-migrate up migration using the Postgres
+// driver against the supplied *sql.DB.
+func migrateUp(db *sqlx.DB) error {
+	pgDrv, err := postgres.WithInstance(db.DB, &postgres.Config{})
+	if err != nil {
+		return err
+	}
+	m, err := migrate.NewWithDatabaseInstance("file://"+findMigrationsDir(), "postgres", pgDrv)
+	if err != nil {
+		return err
+	}
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		return err
+	}
+	return nil
+}
+
+func findMigrationsDir() string {
 	dir, err := os.Getwd()
 	if err != nil {
-		t.Fatalf("os.Getwd: %v", err)
+		panic(err)
 	}
-	// go test runs with cwd = package dir; walk up to the module root to
-	// locate migrations/ regardless of where the suite was invoked from.
 	for {
 		cand := filepath.Join(dir, "migrations")
 		if st, statErr := os.Stat(cand); statErr == nil && st.IsDir() {
@@ -83,38 +145,39 @@ func findMigrationsDir(t *testing.T) string {
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			t.Fatal("migrations/ directory not found walking up from " + dir)
+			panic("migrations/ directory not found walking up from " + dir)
 		}
 		dir = parent
 	}
 }
 
-// TestRunMigrationAndSchema runs the real golang-migrate up migration against a
-// temp DB and verifies the schema_migrations table plus all four domain tables.
+func TestNewDB(t *testing.T) {
+	if !infraTestReady {
+		t.Skipf("TEST_DB_URL unreachable: %v", infraTestErr)
+	}
+
+	if err := infraTestDB.Ping(); err != nil {
+		t.Fatalf("db.Ping() failed: %v", err)
+	}
+
+	// Postgres identity check: current_database() resolves to our throwaway DB.
+	var cur string
+	if err := infraTestDB.GetContext(context.Background(), &cur, "SELECT current_database()"); err != nil {
+		t.Fatalf("current_database: %v", err)
+	}
+	if cur != infraTestName {
+		t.Errorf("current_database = %q, want %q", cur, infraTestName)
+	}
+}
+
+// TestRunMigrationAndSchema runs the real golang-migrate up migration against
+// the throwaway Postgres database and verifies the schema_migrations table
+// plus all four domain tables; then confirms the down migration drops them.
 func TestRunMigrationAndSchema(t *testing.T) {
-	cfg := testConfig(t.TempDir(), "migrate_test.db")
-
-	db, err := infra.NewDB(cfg)
-	if err != nil {
-		t.Fatalf("NewDB failed: %v", err)
+	if !infraTestReady {
+		t.Skipf("TEST_DB_URL unreachable: %v", infraTestErr)
 	}
-	defer db.Close()
-
-	// Wire the migrate database driver onto the SAME pooled *sql.DB so the
-	// migration runs against the identical connection/pragmas (WAL etc.).
-	sqliteDrv, err := sqliteMigrate.WithInstance(db.DB, &sqliteMigrate.Config{})
-	if err != nil {
-		t.Fatalf("sqlite.WithInstance: %v", err)
-	}
-
-	migDir := findMigrationsDir(t)
-	m, err := migrate.NewWithDatabaseInstance("file://"+migDir, "sqlite", sqliteDrv)
-	if err != nil {
-		t.Fatalf("migrate.NewWithDatabaseInstance: %v", err)
-	}
-	if err := m.Up(); err != nil {
-		t.Fatalf("migrate Up: %v", err)
-	}
+	db := infraTestDB
 
 	// 1) migrate's own version table must be present.
 	hasTable(t, db, "schema_migrations")
@@ -126,6 +189,14 @@ func TestRunMigrationAndSchema(t *testing.T) {
 	}
 
 	// 3) Reverse order DROP (down) must clean up cleanly.
+	pgDrv, err := postgres.WithInstance(db.DB, &postgres.Config{})
+	if err != nil {
+		t.Fatalf("postgres.WithInstance: %v", err)
+	}
+	m, err := migrate.NewWithDatabaseInstance("file://"+findMigrationsDir(), "postgres", pgDrv)
+	if err != nil {
+		t.Fatalf("migrate.NewWithDatabaseInstance: %v", err)
+	}
 	if err := m.Down(); err != nil {
 		t.Fatalf("migrate Down: %v", err)
 	}
@@ -145,16 +216,11 @@ func hasTable(t *testing.T, db *sqlx.DB, name string) {
 }
 
 func tableExists(db *sqlx.DB, name string) bool {
-	rows, err := db.QueryContext(context.Background(),
-		"SELECT name FROM sqlite_master WHERE type='table' AND name = ?", name)
+	var exists bool
+	err := db.GetContext(context.Background(), &exists,
+		`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1)`, name)
 	if err != nil {
 		return false
-	}
-	defer rows.Close()
-
-	exists := false
-	for rows.Next() {
-		exists = true
 	}
 	return exists
 }

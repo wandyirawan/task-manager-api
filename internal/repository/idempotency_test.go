@@ -20,6 +20,14 @@ func newStores(t *testing.T) *sqlx.DB {
 	return newTestDB(t)
 }
 
+// newStoresWithPool returns the shared high-concurrency test DB (the pool is
+// sized generously in setup so N-goroutine tests never starve on connection
+// acquisition — the old SQLite SQLITE_BUSY concern does not apply to Postgres).
+func newStoresWithPool(t *testing.T, n int) *sqlx.DB {
+	t.Helper()
+	return newTestDBWithPool(t, n)
+}
+
 // TestIdempotencySequentialDuplicate: first create → task; second create with
 // the same key → replay of the IDENTICAL snapshot; no extra rows.
 func TestIdempotencySequentialDuplicate(t *testing.T) {
@@ -151,7 +159,7 @@ func TestIdempotencyExpiredKey(t *testing.T) {
 
 	// Force-expire the key row directly.
 	if _, err := db.ExecContext(ctx,
-		`UPDATE idempotency_keys SET expires_at = ? WHERE key = ?`,
+		`UPDATE idempotency_keys SET expires_at = $1 WHERE key = $2`,
 		time.Now().UTC().Add(-1*time.Hour), key); err != nil {
 		t.Fatalf("expire: %v", err)
 	}
@@ -177,10 +185,11 @@ func TestIdempotencyExpiredKey(t *testing.T) {
 
 // TestIdempotencyConcurrentSameKey is the REPO-LEVEL race simulation: 50
 // goroutines call CreateTaskWithKey with the same key simultaneously. Exactly
-// one must create; the rest must replay the same task. UNIQUE backstop and
-// busy_timeout (via DSN) are what keep this deterministic.
+// one must create; the rest must replay the same task. The UNIQUE (key,
+// user_id) backstop plus Postgres MVCC/serialization retries keep this
+// deterministic.
 func TestIdempotencyConcurrentSameKey(t *testing.T) {
-	db := newTestDB(t)
+	db := newStoresWithPool(t, 64) // pool is sized ≥ goroutines in setup
 	store := struct {
 		service.IdempotencyStore
 	}{repository.NewTaskRepository(db).(service.IdempotencyStore)}
@@ -258,6 +267,3 @@ func TestIdempotencyConcurrentSameKey(t *testing.T) {
 		t.Errorf("idempotency_keys rows = %d, want 1", keys)
 	}
 }
-
-// dbOf recovers the *sqlx.DB handle from the seeded test helper (used for
-// direct FK seeding in tests that call the store interface directly).

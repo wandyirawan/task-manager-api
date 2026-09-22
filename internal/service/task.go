@@ -21,6 +21,10 @@ type TaskRepository interface {
 	List(ctx context.Context, f domain.TaskFilter) ([]domain.Task, int, error)
 	Update(ctx context.Context, ownerID, taskID string, in domain.UpdateTaskInput) (*domain.Task, error)
 	Delete(ctx context.Context, ownerID, taskID string) error
+	// Assign executes the transactional assign flow (update + log) inside one
+	// SQL transaction and returns ErrForbidden when no matching row belongs to
+	// ownerID.
+	Assign(ctx context.Context, ownerID, taskID, assigneeID string) error
 }
 
 // IdempotencyStore is the atomic persistence contract for idempotent task
@@ -38,6 +42,18 @@ type IdempotencyStore interface {
 	CreateTaskWithKey(ctx context.Context, task *domain.Task, key string) (*domain.Task, bool, error)
 }
 
+// Notifier is called OUTSIDE the assignment transaction to alert the assignee.
+// Implementations can be log-only, email, webhook, etc. For tests a mock that
+// just records calls is used.
+type Notifier interface {
+	Notify(ctx context.Context, taskID, assigneeID, actorID string) error
+}
+
+// noOpNotifier does nothing — useful when the caller doesn't want notifications.
+type noOpNotifier struct{}
+
+func (n noOpNotifier) Notify(context.Context, string, string, string) error { return nil }
+
 // TaskService implements the task use-case layer. All operations are
 // owner-scoped: the authenticated user's ID is threaded into every repository
 // call so ownership is enforced at the query boundary, never in the handler.
@@ -46,6 +62,7 @@ type TaskService struct {
 	idem   IdempotencyStore
 	logger *slog.Logger
 	now    func() time.Time
+	notf   Notifier
 }
 
 // NewTaskService builds a TaskService with the given repository and logger.
@@ -56,11 +73,15 @@ type TaskService struct {
 // operations), so we recover the IdempotencyStore capability from the same
 // repository object via the interface it also implements. Wiring stays in
 // main.go untouched (composition root passes a single *taskRepository).
-func NewTaskService(repo TaskRepository, logger *slog.Logger) *TaskService {
+func NewTaskService(repo TaskRepository, logger *slog.Logger, notf Notifier) *TaskService {
+	if notf == nil {
+		notf = noOpNotifier{}
+	}
 	svc := &TaskService{
 		repo:   repo,
 		logger: logger,
 		now:    time.Now,
+		notf:   notf,
 	}
 	if idem, ok := repo.(IdempotencyStore); ok {
 		svc.idem = idem
@@ -196,4 +217,27 @@ func (s *TaskService) Delete(ctx context.Context, ownerID, taskID string) error 
 		return err
 	}
 	return nil
+}
+
+// Assign moves a task to someone else. The whole operation runs inside a single
+// database transaction: update assignee_id on the task and append a log entry
+// to task_logs. After the tx commits the notifier gets called outside the
+// transaction (failures do NOT undo the assignment). Owner check is done at
+// the SQL layer (WHERE id=? AND owner_id=?), so non-owners cannot reassign.
+func (s *TaskService) Assign(ctx context.Context, ownerID, taskID, assigneeID string) (*domain.Task, error) {
+	if assigneeID == "" {
+		return nil, domain.ErrValidation
+	}
+
+	if err := s.repo.Assign(ctx, ownerID, taskID, assigneeID); err != nil {
+		return nil, err
+	}
+
+	// Notification happens OUTSIDE the transaction. Failures here do NOT undo
+	// the assignment (the user already got the notification they asked for).
+	if err := s.notf.Notify(ctx, taskID, assigneeID, ownerID); err != nil {
+		s.logger.Warn("notify assignee failed", "task_id", taskID, "error", err)
+	}
+
+	return s.Get(ctx, ownerID, taskID)
 }

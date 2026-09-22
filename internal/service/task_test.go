@@ -18,6 +18,8 @@ type fakeRepo struct {
 	// idempotency fakes
 	lookupFn        func(key, userID string) (*domain.IdempotencyRecord, error)
 	createWithKeyFn func(task *domain.Task, key string) (*domain.Task, bool, error)
+	// assign
+	assignFn func(ctx context.Context, ownerID, taskID, assigneeID string) error
 }
 
 func (f *fakeRepo) seed(t *domain.Task) { f.tasks = append(f.tasks, *t) }
@@ -105,9 +107,44 @@ func (f *fakeRepo) CreateTaskWithKey(ctx context.Context, task *domain.Task, key
 	return &cpy, true, nil
 }
 
-func newService(repo TaskRepository) *TaskService {
+// Assign implements service.TaskRepository.Assign: set assignee on existing task.
+func (f *fakeRepo) Assign(ctx context.Context, ownerID, taskID, assigneeID string) error {
+	if f.assignFn != nil {
+		return f.assignFn(ctx, ownerID, taskID, assigneeID)
+	}
+	for i := range f.tasks {
+		t := &f.tasks[i]
+		if t.ID == taskID && t.OwnerID == ownerID {
+			t.AssigneeID = &assigneeID
+			now := time.Now().UTC()
+			t.UpdatedAt = now
+			return nil
+		}
+	}
+	return domain.ErrForbidden
+}
+
+// noopNotifier just records that it was called.
+type noopNotifier struct {
+	called bool
+	last   notifyCall
+}
+
+type notifyCall struct {
+	taskID    string
+	assignee  string
+	actor     string
+}
+
+func (n *noopNotifier) Notify(_ context.Context, taskID, assignee, actor string) error {
+	n.called = true
+	n.last = notifyCall{taskID, assignee, actor}
+	return nil
+}
+
+func newService(repo TaskRepository, notf Notifier) *TaskService {
 	tr := slog.New(slog.NewTextHandler(nopWriter{}, nil))
-	svc := NewTaskService(repo, tr)
+	svc := NewTaskService(repo, tr, notf)
 	fixed := time.Date(2026, 9, 21, 10, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return fixed }
 	return svc
@@ -119,7 +156,8 @@ func (nopWriter) Write(p []byte) (int, error) { return len(p), nil }
 
 func TestServiceCreateHappyPath(t *testing.T) {
 	repo := &fakeRepo{}
-	svc := newService(repo)
+	notf := &noopNotifier{}
+	svc := newService(repo, notf)
 
 	task, err := svc.Create(context.Background(), "user-1", domain.CreateTaskInput{
 		Title:       "Setup CI",
@@ -147,7 +185,8 @@ func TestServiceCreateHappyPath(t *testing.T) {
 }
 
 func TestServiceCreateValidationError(t *testing.T) {
-	svc := newService(&fakeRepo{})
+	notf := &noopNotifier{}
+	svc := newService(&fakeRepo{}, notf)
 
 	// Empty title → ErrValidation, no task persisted.
 	_, err := svc.Create(context.Background(), "user-1", domain.CreateTaskInput{Title: "  "})
@@ -159,7 +198,8 @@ func TestServiceCreateValidationError(t *testing.T) {
 func TestServiceGetNotFound(t *testing.T) {
 	repo := &fakeRepo{}
 	repo.seed(&domain.Task{ID: "t1", OwnerID: "user-1"})
-	svc := newService(repo)
+	notf := &noopNotifier{}
+	svc := newService(repo, notf)
 
 	_, err := svc.Get(context.Background(), "user-1", "missing")
 	if !errors.Is(err, domain.ErrNotFound) {
@@ -172,7 +212,8 @@ func TestServiceUpdatePartialOnly(t *testing.T) {
 	repo.seed(&domain.Task{
 		ID: "t1", OwnerID: "user-1", Title: "old", Description: "keep", Status: domain.TaskStatusTodo,
 	})
-	svc := newService(repo)
+	notf := &noopNotifier{}
+	svc := newService(repo, notf)
 
 	newTitle := "new title"
 	newStatus := domain.TaskStatusDone
@@ -199,7 +240,8 @@ func TestServiceUpdatePartialOnly(t *testing.T) {
 func TestServiceUpdateInvalidStatus(t *testing.T) {
 	repo := &fakeRepo{}
 	repo.seed(&domain.Task{ID: "t1", OwnerID: "user-1", Title: "x"})
-	svc := newService(repo)
+	notf := &noopNotifier{}
+	svc := newService(repo, notf)
 
 	bad := domain.TaskStatus("exploded")
 	_, err := svc.Update(context.Background(), "user-1", "t1", domain.UpdateTaskInput{Status: &bad})
@@ -209,7 +251,8 @@ func TestServiceUpdateInvalidStatus(t *testing.T) {
 }
 
 func TestServiceDeleteNotFound(t *testing.T) {
-	svc := newService(&fakeRepo{})
+	notf := &noopNotifier{}
+	svc := newService(&fakeRepo{}, notf)
 	if err := svc.Delete(context.Background(), "user-1", "nope"); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("err = %v, want ErrNotFound", err)
 	}
@@ -218,7 +261,8 @@ func TestServiceDeleteNotFound(t *testing.T) {
 func TestServiceListNormalizesPagination(t *testing.T) {
 	repo := &fakeRepo{}
 	repo.seed(&domain.Task{ID: "t1", OwnerID: "user-1", Title: "a"})
-	svc := newService(repo)
+	notf := &noopNotifier{}
+	svc := newService(repo, notf)
 
 	// Page 0 / Limit 0 and huge limit must be clamped.
 	tasks, total, err := svc.List(context.Background(), "user-1", domain.TaskFilter{Page: 0, Limit: 0})
@@ -227,5 +271,55 @@ func TestServiceListNormalizesPagination(t *testing.T) {
 	}
 	if total != 1 || len(tasks) != 1 {
 		t.Errorf("list total=%d n=%d, want 1/1", total, len(tasks))
+	}
+}
+
+// --- Assign tests ---
+
+func TestServiceAssignHappyPath(t *testing.T) {
+	repo := &fakeRepo{}
+	repo.seed(&domain.Task{ID: "t1", OwnerID: "user-1", Title: "Fix bug"})
+	notf := &noopNotifier{}
+	svc := newService(repo, notf)
+
+	target := "user-2"
+	task, err := svc.Assign(context.Background(), "user-1", "t1", target)
+	if err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+	if task.AssigneeID == nil || *task.AssigneeID != "user-2" {
+		t.Errorf("assigneeId = %+v, want user-2", task.AssigneeID)
+	}
+	if !notf.called {
+		t.Error("expected notifier to be called")
+	} else if notf.last.taskID != "t1" || notf.last.assignee != "user-2" {
+		t.Errorf("notify call mismatch: %+v", notf.last)
+	}
+}
+
+func TestServiceAssignWrongOwnerReturnsForbidden(t *testing.T) {
+	repo := &fakeRepo{}
+	repo.seed(&domain.Task{ID: "t1", OwnerID: "user-1"})
+	notf := &noopNotifier{}
+	svc := newService(repo, notf)
+
+	_, err := svc.Assign(context.Background(), "user-3", "t1", "user-2")
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("err = %v, want ErrForbidden", err)
+	}
+	if notf.called {
+		t.Error("notifier must not be called when assignment fails")
+	}
+}
+
+func TestServiceAssignMissingAssigneeFailsValidation(t *testing.T) {
+	repo := &fakeRepo{}
+	repo.seed(&domain.Task{ID: "t1", OwnerID: "user-1"})
+	notf := &noopNotifier{}
+	svc := newService(repo, notf)
+
+	_, err := svc.Assign(context.Background(), "user-1", "t1", "")
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("err = %v, want ErrValidation", err)
 	}
 }

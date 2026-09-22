@@ -29,6 +29,29 @@ Atau cukup jalankan sekali:
 make setup   # cek go + docker, install migrate CLI kalau belum ada
 ```
 
+### Development Workflow
+
+`make` (tanpa argumen) menampilkan panduan ini. Urutan kerja harian:
+
+```bash
+# Sekali aja (setup):
+make setup                            # cek tooling, install migrate CLI
+cp .env.example .env                  # lalu isi JWT_SECRET
+
+# Loop development harian:
+make dev                              # nyalain Postgres doang (db service, health-gated)
+make check                            # vet + test + build — gate cepet sebelum push
+make test-race                        # full suite + race detector — gate sebenarnya
+make run                              # API lokal :8080, Swagger di /swagger/index.html
+
+# Gate lengkap / opsional:
+make test-all                         # test + race + anti-flaky -count=2 (kayak CI)
+make dev-restart                      # reset volume Postgres ke fresh (DESTRUCTIVE)
+make watch                            # hot reload (butuh air)
+```
+
+Tips: `make dev` cuma menyalakan database — API-nya jalan di host via `make run`, jadi loop edit-restart tetap cepat tanpa rebuild image. `make test` aman jalan tanpa database (test yang butuh DB otomatis skip, bukan fail).
+
 ## Quick Start (Docker — recommended)
 
 1. Salin template env, lalu isi `JWT_SECRET` dengan secret acak (wajib — aplikasi fail-fast kalau kosong):
@@ -57,7 +80,7 @@ Hentikan stack: `make run-prod-down` (atau `docker compose down`). Volume `pgdat
 
 ## Quick Start (Local, tanpa Docker untuk API)
 
-Butuh PostgreSQL yang jalan di `localhost:5432` (paling gampang: `docker compose up -d db` dari repo ini).
+Butuh PostgreSQL yang jalan di `localhost:5432` (paling gampang: `make dev` — hanya menyalakan service `db`).
 
 1. `cp .env.example .env`, isi `JWT_SECRET`, dan pastikan `DB_URL` mengarah ke Postgres lokal:
 
@@ -220,12 +243,11 @@ Pragmatik runtime:
 ## Testing
 
 ```bash
-make test            # = go test ./...
-go test ./...        # semua package
-
-go test -race ./...  # race detector — wajib hijau
-go vet ./...         # static check
-make vet             # = go vet ./...
+make check           # vet + test + build — gate cepet sebelum push
+make test            # = go test ./... (DB-backed test skip kalau tanpa Postgres)
+make test-race       # = go test -race ./... — wajib hijau
+make test-all        # test + race + anti-flaky -count=2 — urutan CI
+go vet ./...         # static check saja
 ```
 
 Test yang butuh PostgreSQL (repository, infra, dan race suite) otomatis **skip** (bukan fail) kalau `TEST_DB_URL` tidak reachable; set variabel ini untuk menjalankan penuh:

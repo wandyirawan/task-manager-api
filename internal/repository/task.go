@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgerrcode"
 	"github.com/jmoiron/sqlx"
@@ -365,6 +366,49 @@ func (r *taskRepository) Delete(ctx context.Context, ownerID, taskID string) err
 	}
 	if n == 0 {
 		return domain.ErrNotFound
+	}
+	return nil
+}
+
+// Assign executes the whole assign flow in one transaction: update assignee_id
+// and append a task_logs row. Ownership is enforced at the SQL layer so only
+// the real owner can reassign.
+func (r *taskRepository) Assign(ctx context.Context, ownerID, taskID, assigneeID string) error {
+	tx, err := r.db.Beginx()
+	if err != nil {
+		return fmt.Errorf("assign begin tx: %w", err)
+	}
+
+	// Verify ownership and set assignee atomically.
+	result, err := tx.ExecContext(ctx,
+		`UPDATE tasks SET assignee_id = $1, updated_at = $2
+		 WHERE id = $3 AND owner_id = $4`,
+		assigneeID, time.Now().UTC(), taskID, ownerID,
+	)
+	if err != nil {
+		tx.Rollback()
+		return fmt.Errorf("assign update: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		tx.Rollback()
+		return domain.ErrForbidden
+	}
+
+	// Append audit trail.
+	logID := uuid.NewString()
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO task_logs (id, task_id, actor_id, action, payload, created_at)
+		 VALUES ($1, $2, $3, 'assigned', '{}', $4)`,
+		logID, taskID, ownerID, time.Now().UTC(),
+	)
+	if err != nil {
+		tx.Rollback()
+		return fmt.Errorf("assign log: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("assign commit: %w", err)
 	}
 	return nil
 }

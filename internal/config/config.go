@@ -13,7 +13,7 @@ type Config struct {
 	Port           int    `env:"PORT"`
 	Env            string `env:"ENV"`
 	JWTSecret      string `env:"JWT_SECRET"`
-	DBPath         string `env:"DB_PATH"`
+	DBURL          string `env:"DB_URL"`
 	DBMaxOpenConns int    `env:"DB_MAX_OPEN_CONNS"`
 	DBMaxIdleConns int    `env:"DB_MAX_IDLE_CONNS"`
 }
@@ -23,9 +23,9 @@ func New() (*Config, error) {
 	c := &Config{
 		Port:           8080,
 		Env:            "dev",
-		DBPath:         "./data/tasks.db",
-		DBMaxOpenConns: 4,
-		DBMaxIdleConns: 4,
+		DBURL:          "postgres://tm_user:tm_pass@localhost:5432/tmapi?sslmode=disable",
+		DBMaxOpenConns: 10,
+		DBMaxIdleConns: 10,
 	}
 	if err := c.load(); err != nil {
 		return nil, err

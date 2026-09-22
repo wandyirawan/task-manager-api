@@ -1,26 +1,22 @@
 package infra
 
 import (
-	_ "modernc.org/sqlite" // registers the "sqlite" database/sql driver
+	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver
 
 	"github.com/jmoiron/sqlx"
 	"github.com/wandyirawan/task-manager-api/internal/config"
 )
 
-// NewDB opens a sqlite connection via sqlx using the config values.
+// NewDB opens a PostgreSQL connection via sqlx using the config values.
 //
-// Pragmas (WAL, busy_timeout, foreign_keys) are supplied through the DSN so
-// the modernc.org/sqlite driver applies them to EVERY new pooled connection.
-// Never issue `PRAGMA ...` via db.Exec once at startup: foreign_keys and
-// busy_timeout are per-connection, so a one-off Exec only touches one pooled
-// connection while the rest silently run with FK=OFF.
+// The driver is jackc/pgx/v5 (pure Go, CGO off) registered under the
+// "pgx" name. The connection URL comes entirely from config.DBURL so the
+// same binary works against any Postgres (local, Docker Compose service, or
+// managed). Foreign keys, timeouts and pool sizing are all server/driver
+// defaults for Postgres — no per-connection pragmas are needed (unlike
+// SQLite, PG enforces FK integrity and MVCC isolation natively).
 func NewDB(cfg *config.Config) (*sqlx.DB, error) {
-	dsn := "file:" + cfg.DBPath +
-		"?_pragma=journal_mode(WAL)" +
-		"&_pragma=busy_timeout(5000)" +
-		"&_pragma=foreign_keys(ON)"
-
-	db, err := sqlx.Connect("sqlite", dsn)
+	db, err := sqlx.Connect("pgx", cfg.DBURL)
 	if err != nil {
 		return nil, err
 	}

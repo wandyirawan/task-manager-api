@@ -29,14 +29,15 @@ func NewTaskHandler(svc *service.TaskService) *TaskHandler {
 }
 
 // RegisterRoutes mounts the task routes onto a (later protected) group.
-// POST "" → POST /tasks; GET "" → GET /tasks; etc., so the parent can group
-// them under /tasks and apply the auth middleware.
+// POST "": create; GET "": list; GET /:id: get; PUT /:id: update; DELETE /:id: delete;
+// POST /:id/assign: assign task to someone else.
 func RegisterRoutes(app fiber.Router, h *TaskHandler) {
 	app.Post("", h.Create)
 	app.Get("", h.List)
 	app.Get("/:id", h.Get)
 	app.Put("/:id", h.Update)
 	app.Delete("/:id", h.Delete)
+	app.Post("/:id/assign", h.Assign)
 }
 
 // userID extracts the authenticated caller from Locals, mirroring the contract
@@ -61,7 +62,7 @@ func userID(c fiber.Ctx) (string, error) {
 // @Param        Idempotency-Key header string true "Idempotency key (UUID v4)"
 // @Param        task body domain.CreateTaskInput true "Task payload"
 // @Success      201 {object} map[string]interface{}
-// @Failure      400 {object} api.ErrorResponse
+// @Failure      400 {object} ErrorResp
 // @Router       /tasks [post]
 func (h *TaskHandler) Create(c fiber.Ctx) error {
 	ownerID, err := userID(c)
@@ -111,7 +112,7 @@ func (h *TaskHandler) Create(c fiber.Ctx) error {
 // @Produce      json
 // @Param        id path string true "Task ID"
 // @Success      200 {object} map[string]interface{}
-// @Failure      404 {object} api.ErrorResponse
+// @Failure      404 {object} ErrorResp
 // @Router       /tasks/{id} [get]
 func (h *TaskHandler) Get(c fiber.Ctx) error {
 	ownerID, err := userID(c)
@@ -181,8 +182,8 @@ func (h *TaskHandler) List(c fiber.Ctx) error {
 // @Param        id   path string                   true "Task ID"
 // @Param        task body domain.UpdateTaskInput    true "Task patch"
 // @Success      200  {object} map[string]interface{}
-// @Failure      400  {object} api.ErrorResponse
-// @Failure      404  {object} api.ErrorResponse
+// @Failure      400  {object} ErrorResp
+// @Failure      404  {object} ErrorResp
 // @Router       /tasks/{id} [put]
 func (h *TaskHandler) Update(c fiber.Ctx) error {
 	ownerID, err := userID(c)
@@ -210,7 +211,7 @@ func (h *TaskHandler) Update(c fiber.Ctx) error {
 // @Produce      json
 // @Param        id path string true "Task ID"
 // @Success      204 "No Content"
-// @Failure      404 {object} api.ErrorResponse
+// @Failure      404 {object} ErrorResp
 // @Router       /tasks/{id} [delete]
 func (h *TaskHandler) Delete(c fiber.Ctx) error {
 	ownerID, err := userID(c)
@@ -223,4 +224,55 @@ func (h *TaskHandler) Delete(c fiber.Ctx) error {
 	}
 
 	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// AssignRequest carries the JSON body for task assignment.
+type AssignRequest struct {
+	AssigneeID string `json:"assigneeId"`
+}
+
+// ErrorResp is a simple error shape used in swag annotations.
+type ErrorResp struct {
+	Status    int    `json:"status"`
+	Code      string `json:"code"`
+	Message   string `json:"message"`
+	Timestamp string `json:"timestamp"`
+}
+
+// Assign godoc
+// @Summary      Assign task
+// @Description  Assign this task to another user. The caller must be the task
+// owner. On success the assignee gets notified outside the transaction.
+// Returns 403 when the caller is not the owner or the task does not exist.
+// @Tags         tasks
+// @Accept       json
+// @Produce      json
+// @Param        id      path     string              true "Task ID"
+// @Param        request body      AssignRequest       true "Assignee ID"
+// @Success      200     {object} map[string]interface{}
+// @Failure      400     {object} ErrorResp
+// @Failure      403     {object} ErrorResp
+// @Failure      404     {object} ErrorResp
+// @Router       /tasks/{id}/assign [post]
+func (h *TaskHandler) Assign(c fiber.Ctx) error {
+	ownerID, err := userID(c)
+	if err != nil {
+		return err
+	}
+
+	var req AssignRequest
+	if err := c.Bind().JSON(&req); err != nil {
+		return fmt.Errorf("%w: invalid body", domain.ErrValidation)
+	}
+
+	if _, err := uuid.Parse(req.AssigneeID); err != nil {
+		return fmt.Errorf("%w: invalid assignee ID", domain.ErrValidation)
+	}
+
+	task, err := h.svc.Assign(c.Context(), ownerID, c.Params("id"), req.AssigneeID)
+	if err != nil {
+		return err
+	}
+
+	return c.JSON(fiber.Map{"data": task})
 }

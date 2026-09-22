@@ -19,18 +19,28 @@ import (
 	"github.com/wandyirawan/task-manager-api/internal/service"
 )
 
+// noopNotifier does nothing — used by handler tests when they don't care about notifications.
+type noopNotifier struct{}
+
+func (noopNotifier) Notify(_ context.Context, _, _, _ string) error { return nil }
+
 // handlerFakeRepo is a tiny in-memory TaskRepository used to back the real
 // service so the handler test exercises the whole parse→service→respond path.
 // It also implements service.IdempotencyStore so the production
 // NewTaskService wiring (which recovers the IdempotencyStore from the same repo
 // object) is exercised here too.
 type handlerFakeRepo struct {
-	tasks map[string]*domain.Task
-	keys  map[string]*domain.IdempotencyRecord
+	tasks    map[string]*domain.Task
+	keys     map[string]*domain.IdempotencyRecord
+	assigned map[string]string // taskID → assigneeID
 }
 
 func newHandlerFakeRepo() *handlerFakeRepo {
-	return &handlerFakeRepo{tasks: map[string]*domain.Task{}, keys: map[string]*domain.IdempotencyRecord{}}
+	return &handlerFakeRepo{
+		tasks:    map[string]*domain.Task{},
+		keys:     map[string]*domain.IdempotencyRecord{},
+		assigned: map[string]string{},
+	}
 }
 
 func (r *handlerFakeRepo) Create(ctx context.Context, task *domain.Task) error {
@@ -102,8 +112,8 @@ func (r *handlerFakeRepo) LookupByKey(ctx context.Context, key, userID string) (
 	return rec, nil
 }
 
-// CreateTaskWithKey implements service.IdempotencyStore: atomic-feeling in
-// memory insert of task + snapshot, with a UNIQUE (key,userID) race backstop.
+// CreateTaskWithKey implements service.IdempotencyStore: atomic-feeling insert
+// of task + snapshot, with a UNIQUE (key,userID) race backstop.
 func (r *handlerFakeRepo) CreateTaskWithKey(ctx context.Context, task *domain.Task, key string) (*domain.Task, bool, error) {
 	k := task.OwnerID + "|" + key
 	if existing, ok := r.keys[k]; ok {
@@ -131,6 +141,17 @@ func (r *handlerFakeRepo) CreateTaskWithKey(ctx context.Context, task *domain.Ta
 	return &cpy, true, nil
 }
 
+// Assign implements service.TaskRepository.Assign for handler tests.
+func (r *handlerFakeRepo) Assign(ctx context.Context, ownerID, taskID, assigneeID string) error {
+	t, ok := r.tasks[taskID]
+	if !ok || t.OwnerID != ownerID {
+		return domain.ErrForbidden
+	}
+	t.AssigneeID = &assigneeID
+	r.assigned[taskID] = assigneeID
+	return nil
+}
+
 type nopWriter struct{}
 
 func (nopWriter) Write(p []byte) (int, error) { return len(p), nil }
@@ -142,7 +163,7 @@ func (nopWriter) Write(p []byte) (int, error) { return len(p), nil }
 func newHandlerApp(t *testing.T, userID string) *fiber.App {
 	t.Helper()
 	lg := slog.New(slog.NewTextHandler(nopWriter{}, nil))
-	svc := service.NewTaskService(newHandlerFakeRepo(), lg)
+	svc := service.NewTaskService(newHandlerFakeRepo(), lg, noopNotifier{})
 
 	app := fiber.New(fiber.Config{ErrorHandler: api.NewErrorHandler("dev")})
 
@@ -462,3 +483,48 @@ func TestCreateReplayAfterMutation(t *testing.T) {
 			first, replay)
 	}
 }
+
+// --- P6 assign handler tests ---
+
+func TestAssignTask(t *testing.T) {
+	app := newHandlerApp(t, "user-42")
+	tsk := createTask(t, app)
+
+	target := uuid.NewString()
+	status, data := doReq(t, app, "POST", "/tasks/"+tsk.ID+"/assign",
+		`{"assigneeId":"`+target+`"}`)
+	if status != fiber.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", status, data)
+	}
+	var env struct {
+		Data domain.Task `json:"data"`
+	}
+	decode(t, data, &env)
+	if env.Data.AssigneeID == nil || *env.Data.AssigneeID != target {
+		t.Errorf("assigneeId = %+v, want %s", env.Data.AssigneeID, target)
+	}
+}
+
+func TestAssignTaskNotFound(t *testing.T) {
+	app := newHandlerApp(t, "user-42")
+
+	status, data := doReq(t, app, "POST", "/tasks/nonexistent/assign",
+		`{"assigneeId":"`+uuid.NewString()+`"}`)
+	if status != fiber.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (body %s)", status, data)
+	}
+}
+
+func TestAssignTaskInvalidUUID(t *testing.T) {
+	app := newHandlerApp(t, "user-42")
+	tsk := createTask(t, app)
+
+	status, data := doReq(t, app, "POST", "/tasks/"+tsk.ID+"/assign", `{"assigneeId":"not-a-uuid"}`)
+	if status != fiber.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body %s)", status, data)
+	}
+}
+
+// --- removed debug tests
+
+

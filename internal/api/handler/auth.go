@@ -51,8 +51,8 @@ func bindJSON(c fiber.Ctx, dst any) error {
 // @Produce      json
 // @Param        body body domain.RegisterInput true "Registration payload"
 // @Success      201 {object} map[string]interface{}
-// @Failure      400 {object} api.ErrorResponse
-// @Failure      409 {object} api.ErrorResponse
+// @Failure      400 {object} ErrorResp
+// @Failure      409 {object} ErrorResp
 // @Router       /register [post]
 func (h *AuthHandler) Register(c fiber.Ctx) error {
 	var in domain.RegisterInput
@@ -78,8 +78,8 @@ func (h *AuthHandler) Register(c fiber.Ctx) error {
 // @Produce      json
 // @Param        body body domain.RegisterInput true "Login payload"
 // @Success      200 {object} map[string]interface{}
-// @Failure      400 {object} api.ErrorResponse
-// @Failure      401 {object} api.ErrorResponse
+// @Failure      400 {object} ErrorResp
+// @Failure      401 {object} ErrorResp
 // @Router       /login [post]
 func (h *AuthHandler) Login(c fiber.Ctx) error {
 	var in domain.RegisterInput

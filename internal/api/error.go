@@ -72,6 +72,8 @@ func classify(err error) errInfo {
 	switch {
 	case errors.Is(err, domain.ErrValidation):
 		return errInfo{status: fiber.StatusBadRequest, message: domain.ErrValidation.Error()}
+	case errors.Is(err, domain.ErrForbidden):
+		return errInfo{status: fiber.StatusForbidden, message: domain.ErrForbidden.Error()}
 	case errors.Is(err, domain.ErrUnauthorized):
 		return errInfo{status: fiber.StatusUnauthorized, message: domain.ErrUnauthorized.Error()}
 	case errors.Is(err, domain.ErrNotFound):

@@ -1,146 +1,146 @@
 # Task Manager API
 
-REST API manajemen task multi-user yang dibangun dengan [Go](https://go.dev/) dan [Fiber v3](https://gofiber.io/). Menyediakan autentikasi JWT (register/login), CRUD `/tasks` dengan filter status, pencarian title, dan pagination, pembuatan task yang **idempoten** (`Idempotency-Key`), assignment dengan audit trail dalam satu transaction, serta **Swagger UI** untuk dokumentasi interaktif. Database-nya **PostgreSQL** — jalan penuh via Docker Compose.
+A multi-user task management REST API built with [Go](https://go.dev/) and [Fiber v3](https://gofiber.io/). Provides JWT authentication (register/login), `/tasks` CRUD with status filtering, title search, and pagination, **idempotent** task creation (`Idempotency-Key`), assignment with an audit trail in a single transaction, and a **Swagger UI** for interactive docs. Backed by **PostgreSQL** — runs fully via Docker Compose.
 
 ## Tech Stack
 
-| Layer           | Teknologi                                                                     |
-|-----------------|-------------------------------------------------------------------------------|
+| Layer           | Technology                                                                     |
+|-----------------|--------------------------------------------------------------------------------|
 | Web framework   | [Fiber v3](https://gofiber.io/)                                               |
 | Database        | [PostgreSQL 16](https://www.postgresql.org/) via `jackc/pgx/v5` (stdlib driver) |
 | Query / SQL     | [jmoiron/sqlx](https://github.com/jmoiron/sqlx)                               |
-| Migrations      | [golang-migrate/migrate](https://github.com/golang-migrate/migrate) (embedded, jalan otomatis saat boot) |
+| Migrations      | [golang-migrate/migrate](https://github.com/golang-migrate/migrate) (embedded, runs automatically at boot) |
 | Logging         | `log/slog` (structured JSON → stdout)                                         |
-| Auth            | [golang-jwt/jwt v5](https://github.com/golang-jwt/jwt) + `golang.org/x/crypto/bcrypt` (middleware hand-rolled) |
+| Auth            | [golang-jwt/jwt v5](https://github.com/golang-jwt/jwt) + `golang.org/x/crypto/bcrypt` (hand-rolled middleware) |
 | Swagger         | [swaggo](https://github.com/swaggo/swag) + `gofiber/contrib/v3/swaggo`        |
 | Env parsing     | `caarlos0/env/v11`                                                            |
-| Testing         | `testing` stdlib + race suite end-to-end (real HTTP + real PostgreSQL)        |
+| Testing         | `testing` stdlib + end-to-end race suite (real HTTP + real PostgreSQL)        |
 
 ## Requirements
 
 - Go **1.27+**
-- **Docker + Docker Compose** (untuk PostgreSQL dan/atau full stack)
-- `make` (opsional — bisa diganti `go run` / `go test` langsung)
-- `migrate` CLI (opsional — hanya untuk migrasi manual ke DB eksternal; binary auto-migrate saat boot)
+- **Docker + Docker Compose** (for PostgreSQL and/or the full stack)
+- `make` (optional — can be replaced with `go run` / `go test` directly)
+- `migrate` CLI (optional — only for manual migrations against an external DB; the binary auto-migrates at boot)
 
-Atau cukup jalankan sekali:
+Or just run once:
 
 ```bash
-make setup   # cek go + docker, install migrate CLI kalau belum ada
+make setup   # checks go + docker, installs the migrate CLI if missing
 ```
 
 ### Development Workflow
 
-`make` (tanpa argumen) menampilkan panduan ini. Urutan kerja harian:
+`make` (no arguments) prints this guide. Daily working order:
 
 ```bash
-# Sekali aja (setup):
-make setup                            # cek tooling, install migrate CLI
-cp .env.example .env                  # lalu isi JWT_SECRET
+# Once (setup):
+make setup                            # checks tooling, installs migrate CLI
+cp .env.example .env                  # then set JWT_SECRET
 
-# Loop development harian:
-make dev                              # nyalain Postgres doang (db service, health-gated)
-make check                            # vet + test + build — gate cepet sebelum push
-make test-race                        # full suite + race detector — gate sebenarnya
-make run                              # API lokal :8080, Swagger di /swagger/index.html
+# Daily dev loop:
+make dev                              # starts Postgres only (db service, health-gated)
+make check                            # vet + test + build — quick gate before push
+make test-race                        # full suite + race detector — the real gate
+make run                              # local API on :8080, Swagger at /swagger/index.html
 
-# Gate lengkap / opsional:
-make test-all                         # test + race + anti-flaky -count=2 (kayak CI)
-make dev-restart                      # reset volume Postgres ke fresh (DESTRUCTIVE)
-make watch                            # hot reload (butuh air)
+# Full / optional gates:
+make test-all                         # test + race + anti-flaky -count=2 (like CI)
+make dev-restart                      # resets the Postgres volume to fresh (DESTRUCTIVE)
+make watch                            # hot reload (requires air)
 ```
 
-Tips: `make dev` cuma menyalakan database — API-nya jalan di host via `make run`, jadi loop edit-restart tetap cepat tanpa rebuild image. `make test` aman jalan tanpa database (test yang butuh DB otomatis skip, bukan fail).
+Tip: `make dev` only starts the database — the API runs on the host via `make run`, keeping the edit-restart loop fast without image rebuilds. `make test` is safe to run without a database (DB-dependent tests automatically skip instead of fail).
 
 ## Quick Start (Docker — recommended)
 
-1. Salin template env, lalu isi `JWT_SECRET` dengan secret acak (wajib — aplikasi fail-fast kalau kosong):
+1. Copy the env template and set `JWT_SECRET` to a random secret (required — the app fails fast if empty):
 
    ```bash
    cp .env.example .env
-   # edit .env → JWT_SECRET=... (string acak, jangan kosong)
+   # edit .env → JWT_SECRET=... (random string, never empty)
    ```
 
-2. Build dan jalankan full stack (API + PostgreSQL):
+2. Build and run the full stack (API + PostgreSQL):
 
    ```bash
    make run-prod            # = docker compose up -d --build
-   # atau tanpa make:
+   # or without make:
    docker compose up -d --build
    ```
 
-3. Cek health dan buka Swagger UI:
+3. Check health and open the Swagger UI:
 
    ```bash
    curl localhost:8080/healthz          # → ok
    open http://localhost:8080/swagger/index.html
    ```
 
-Hentikan stack: `make run-prod-down` (atau `docker compose down`). Volume `pgdata` dipertahankan — data tidak hilang antar restart.
+Stop the stack with `make run-prod-down` (or `docker compose down`). The `pgdata` volume is preserved — data survives restarts.
 
-## Quick Start (Local, tanpa Docker untuk API)
+## Quick Start (Local, no Docker for the API)
 
-Butuh PostgreSQL yang jalan di `localhost:5432` (paling gampang: `make dev` — hanya menyalakan service `db`).
+Requires PostgreSQL running at `localhost:5432` (easiest: `make dev` — starts only the `db` service).
 
-1. `cp .env.example .env`, isi `JWT_SECRET`, dan pastikan `DB_URL` mengarah ke Postgres lokal:
+1. `cp .env.example .env`, set `JWT_SECRET`, and point `DB_URL` at your local Postgres:
 
    ```
-   DB_URL=postgres://tm_user:tm_pass@localhost:5432/tmapi?sslmode=disable
+   DB_URL=postgres://tm_user:***@localhost:5432/tmapi?sslmode=disable
    ```
 
-2. Jalankan (migrasi schema otomatis saat boot, fail-fast kalau gagal):
+2. Run it (schema migrations apply automatically at boot, fail-fast on error):
 
    ```bash
    make run                 # demo: PORT=8080 ENV=dev JWT_SECRET=demo-secret-for-testing go run ./cmd/api
-   # atau tanpa make:
+   # or without make:
    go run ./cmd/api
    ```
 
 ### Environment Variables
 
-| Variable            | Wajib | Default                 | Keterangan                                                                 |
-|---------------------|-------|-------------------------|----------------------------------------------------------------------------|
-| `PORT`              | –     | `8080`                  | Port HTTP yang di-listen.                                                  |
-| `ENV`               | –     | `dev`                   | `dev` atau `prod`. Di `prod`, detail internal disembunyikan pada pesan error 5xx. |
-| `JWT_SECRET`        | ✓     | –                       | Secret penanda JWT (HS256). Kosong → fail-fast (aplikasi menolak jalan).   |
-| `DB_URL`            | –     | `postgres://tm_user:tm_pass@localhost:5432/tmapi?sslmode=disable` | Connection string PostgreSQL. Di compose, host-nya `db` (nama service). |
-| `DB_MAX_OPEN_CONNS` | –     | `10`                    | Maksimum koneksi DB dibuka bersamaan (pool dibatasi, bukan unlimited).     |
-| `DB_MAX_IDLE_CONNS` | –     | `4`                     | Maksimum koneksi idle di pool.                                             |
+| Variable            | Required | Default                 | Description                                                                 |
+|---------------------|----------|-------------------------|-----------------------------------------------------------------------------|
+| `PORT`              | –        | `8080`                  | HTTP listen port.                                                           |
+| `ENV`               | –        | `dev`                   | `dev` or `prod`. In `prod`, internal details are hidden from 5xx error messages. |
+| `JWT_SECRET`        | ✓        | –                       | JWT signing secret (HS256). Empty → fail-fast (the app refuses to start).   |
+| `DB_URL`            | –        | `postgres://tm_user:***@localhost:5432/tmapi?sslmode=disable` | PostgreSQL connection string. In compose, the host is `db` (the service name). |
+| `DB_MAX_OPEN_CONNS` | –        | `10`                    | Max concurrently open DB connections (pool is bounded, not unlimited).      |
+| `DB_MAX_IDLE_CONNS` | –        | `4`                     | Max idle connections in the pool.                                           |
 
-`JWT_SECRET` tidak punya default dan divalidasi fail-fast saat startup. Field lain punya default di [`internal/config/config.go`](internal/config/config.go).
+`JWT_SECRET` has no default and is validated fail-fast at startup. Other fields have defaults defined in [`internal/config/config.go`](internal/config/config.go).
 
 ## Running with Docker
 
-Image multi-stage: build `CGO_ENABLED=0` lalu runtime `distroless/static` (binary statis, no shell). Migrasi tetap jalan otomatis di dalam container saat boot.
+Multi-stage image: builds with `CGO_ENABLED=0`, runtime is `distroless/static` (static binary, no shell). Migrations still run automatically inside the container at boot.
 
 ```bash
-cp .env.example .env          # wajib: compose membaca env_file .env
+cp .env.example .env          # required: compose reads env_file .env
 make run-prod                 # = docker compose up -d --build
 ```
 
-- Service `api` mengekspos `${PORT:-8080}:8080` dan menunggu `db` healthy (`pg_isready`) sebelum start (`depends_on: condition: service_healthy`).
-- Service `db` = PostgreSQL 16-alpine, volume `pgdata` untuk persistensi, port `5432` diekspos ke host untuk test suite dan `make migrate-*`.
-- Log container dirotasi via driver `json-file` (`max-size 10m`, `max-file 3`).
-- Hentikan: `make run-prod-down`.
+- The `api` service exposes `${PORT:-8080}:8080` and waits for `db` to be healthy (`pg_isready`) before starting (`depends_on: condition: service_healthy`).
+- The `db` service is PostgreSQL 16-alpine with a `pgdata` volume for persistence; port `5432` is exposed to the host for the test suite and `make migrate-*`.
+- Container logs rotate via the `json-file` driver (`max-size 10m`, `max-file 3`).
+- Stop with `make run-prod-down`.
 
 ## API Endpoints
 
-Semua response JSON. List response membawa envelope `{ data, meta: { page, limit, total } }`. Error konsisten: `{ status, code, message, timestamp }`.
+All responses are JSON. List responses carry an envelope `{ data, meta: { page, limit, total } }`. Errors are consistent: `{ status, code, message, timestamp }`.
 
-| Method | Path                     | Auth | Catatan                                                                 |
-|--------|--------------------------|------|-------------------------------------------------------------------------|
-| POST   | `/register`              | –    | body: `email`, `password` → kembalikan JWT.                            |
-| POST   | `/login`                 | –    | body: `email`, `password` → access token (HS256, exp 24h).             |
-| POST   | `/tasks`                 | ✓    | header `Idempotency-Key: <uuid>` → create idempoten (snapshot replay).  |
+| Method | Path                     | Auth | Notes                                                                 |
+|--------|--------------------------|------|-----------------------------------------------------------------------|
+| POST   | `/register`              | –    | body: `email`, `password` → returns a JWT.                            |
+| POST   | `/login`                 | –    | body: `email`, `password` → access token (HS256, 24h exp).             |
+| POST   | `/tasks`                 | ✓    | header `Idempotency-Key: <uuid>` → idempotent create (snapshot replay). |
 | GET    | `/tasks`                 | ✓    | query `?status=&search=&limit=&page=`.                                 |
-| GET    | `/tasks/:id`             | ✓    | owner check di query → 404 kalau milik user lain.                      |
+| GET    | `/tasks/:id`             | ✓    | owner check in the query → 404 if owned by another user.               |
 | PUT    | `/tasks/:id`             | ✓    | body: `title` / `description` / `status`.                              |
-| DELETE | `/tasks/:id`             | ✓    | –                                                                       |
-| POST   | `/tasks/:id/assign`      | ✓    | body: `assigneeId` — update assignee + `task_logs` dalam satu tx; hanya owner (403 kalau bukan). |
-| GET    | `/healthz`               | –    | healthcheck (Docker).                                                   |
-| GET    | `/swagger/index.html`    | –    | Swagger UI (spec di `/swagger/doc.json`).                              |
+| DELETE | `/tasks/:id`             | ✓    | –                                                                      |
+| POST   | `/tasks/:id/assign`      | ✓    | body: `assigneeId` — updates assignee + `task_logs` in one tx; owner only (403 otherwise). |
+| GET    | `/healthz`               | –    | healthcheck (Docker).                                                  |
+| GET    | `/swagger/index.html`    | –    | Swagger UI (spec at `/swagger/doc.json`).                              |
 
-Semua route di atas — kecuali auth publik, health, dan swagger — dilindungi middleware JWT hand-rolled yang menaruh `user_id` di `c.Locals()`.
+All routes above — except public auth, health, and swagger — are protected by a hand-rolled JWT middleware that places `user_id` in `c.Locals()`.
 
 ## Architecture
 
@@ -150,124 +150,124 @@ Semua route di atas — kecuali auth publik, health, dan swagger — dilindungi 
 task-manager-api/
 ├── cmd/api/main.go            # composition root: config → deps → server → graceful shutdown
 ├── internal/
-│   ├── config/                # struct Config + parse env + fail-fast validasi
+│   ├── config/                # Config struct + env parsing + fail-fast validation
 │   ├── api/
 │   │   ├── middleware/        # request_id, logging, error handler, auth JWT, recovery
 │   │   ├── handler/           # THIN: parse request → service → format response (+ swagger annotations)
-│   │   └── docs/              # output swag init (docs.go, swagger.json) — di-commit
-│   ├── domain/                # Task, User, Status, error codes — stdlib saja
-│   ├── service/               # business logic + DEFINISI interface repository
-│   ├── repository/            # implementasi interface dengan sqlx + pgx
+│   │   └── docs/              # swag init output (docs.go, swagger.json) — committed
+│   ├── domain/                # Task, User, Status, error codes — stdlib only
+│   ├── service/               # business logic + repository interface DEFINITIONS
+│   ├── repository/            # implements the interfaces with sqlx + pgx
 │   └── infra/                 # DB pool (pgx), logger, JWT helper, embedded migrations
-├── migrations/                # SQL golang-migrate (000001_init.up.sql / .down.sql), di-embed
+├── migrations/                # SQL golang-migrate (000001_init.up.sql / .down.sql), embedded
 ├── Dockerfile                 # multi-stage, CGO_ENABLED=0 → distroless
-├── docker-compose.yml         # api + postgres:16-alpine (healthcheck pg_isready)
-├── .env.example              # di-commit; .env asli di-gitignore
+├── docker-compose.yml         # api + postgres:16-alpine (pg_isready healthcheck)
+├── .env.example               # committed; the real .env is gitignored
 ├── Makefile                   # setup, run, build, test, vet, docker-*, deploy, migrate-*
 └── README.md
 ```
 
 **Dependency rules:**
 
-- `handler` tipis — hanya parse request dan format response, tidak ada SQL/business logic.
-- `service` mendefinisikan interface yang dibutuhkan (`TaskRepository`, `IdempotencyStore`, `Notifier`); `repository` yang mengimplementasikan → mudah di-mock di unit test tanpa DB.
-- `domain` lapisan paling bawah, hanya import stdlib.
-- `main.go` satu-satunya yang melakukan wiring (constructor injection manual, tanpa framework DI).
-- Config dibaca dari env via struct + validasi presence; `JWT_SECRET` kosong → exit fail-fast.
+- `handler` is thin — only parses requests and formats responses; no SQL or business logic.
+- `service` defines the interfaces it needs (`TaskRepository`, `IdempotencyStore`, `Notifier`); `repository` implements them → easy to mock in unit tests without a DB.
+- `domain` is the lowest layer, imports only the stdlib.
+- `main.go` is the only place that wires things (manual constructor injection, no DI framework).
+- Config is read from env via a struct + presence validation; empty `JWT_SECRET` → fail-fast exit.
 
 ### Patterns
 
-Layered architecture dengan **repository pattern** dan **constructor injection** — tanpa ceremony hexagonal/DDD yang tidak proporsional untuk skala 4 tabel.
+Layered architecture with the **repository pattern** and **constructor injection** — without the hexagonal/DDD ceremony that would be disproportionate for a 4-table app.
 
-| Pattern              | Di mana                              | Kenapa ada                                                |
+| Pattern              | Where                                | Why it exists                                             |
 |----------------------|--------------------------------------|-----------------------------------------------------------|
-| Layered architecture  | struktur folder                       | batas antar-layer testable, bukan spaghetti               |
-| Repository           | interface di service, impl di repository | mockable, unit test tanpa DB                        |
-| Constructor injection | `main.go`                           | dependency injection manual tanpa framework               |
-| Middleware chain     | request_id → logging → auth → recovery | cross-cutting, tidak dibebankan ke handler             |
-| Sentinel + wrapped errors | `domain` + handler               | satu sumber code error, `errors.Is/As`                    |
-| Adapter              | `Notifier` (log-based di main.go)    | notifikasi eksplisit sebagai interface, mockable          |
+| Layered architecture  | folder structure                     | layer boundaries stay testable, not spaghetti             |
+| Repository           | interface in service, impl in repository | mockable, unit tests without a DB                     |
+| Constructor injection | `main.go`                            | manual dependency injection without a framework           |
+| Middleware chain     | request_id → logging → auth → recovery | cross-cutting concerns don't leak into handlers         |
+| Sentinel + wrapped errors | `domain` + handler              | one source of error codes, `errors.Is/As`                 |
+| Adapter              | `Notifier` (log-based in main.go)    | notifications explicit as an interface, mockable          |
 
-### Desain idempotency (`POST /tasks`)
+### Idempotency design (`POST /tasks`)
 
-Key dan task di-insert dalam **satu transaction** — tidak pernah di-commit terpisah:
+The key and the task are inserted in **one transaction** — never committed separately:
 
 ```
 POST /tasks (header Idempotency-Key: <uuid>)
-├─ 0. Validasi header + format UUID → invalid? 400 INVALID_IDEMPOTENCY_KEY
-├─ 1. FAST PATH (read tanpa lock): SELECT key
-│     └─ ketemu, belum expired, ada snapshot → REPLAY response identik (201)
+├─ 0. Validate header + UUID format → invalid? 400 INVALID_IDEMPOTENCY_KEY
+├─ 1. FAST PATH (lock-free read): SELECT key
+│     └─ found, not expired, has snapshot → REPLAY identical response (201)
 ├─ 2. SLOW PATH: BEGIN (write path)
-│     a. lazy DELETE key expired (dalam tx yang sama)
+│     a. lazy DELETE of expired keys (in the same tx)
 │     b. INSERT tasks → task_id
 │     c. INSERT idempotency_keys(snapshot, expires_at = +24h)
 │     COMMIT → 201
 ```
 
-- UNIQUE constraint pada PK composite `(key, user_id)` = backstop anti-race: dua request yang nge-race, yang kalah kena UNIQUE violation → rollback bersih → replay snapshot pemenang.
-- Key di-scope per user, jadi key sama antar user tidak bertabrakan.
-- Snapshot response disimpan (`response_status` + `response_body`) — replay mengembalikan body byte-per-byte identik dengan request pertama, meski task sudah di-mutasi setelahnya.
-- Expiry 24 jam, dicek lazy saat lookup (tanpa cron).
+- A UNIQUE constraint on the composite PK `(key, user_id)` is the anti-race backstop: two racing requests, the loser hits the UNIQUE violation → clean rollback → replays the winner's snapshot.
+- Keys are scoped per user, so the same key across users never collides.
+- The response snapshot is stored (`response_status` + `response_body`) — replay returns a body byte-for-byte identical to the first request, even if the task was mutated afterwards.
+- 24h expiry, checked lazily on lookup (no cron).
 
-### Transaction assign (`POST /tasks/:id/assign`)
+### Assignment transaction (`POST /tasks/:id/assign`)
 
-Assignment + audit trail berada dalam **satu transaction**:
+Assignment + audit trail live in **one transaction**:
 
 ```
 BEGIN
   UPDATE tasks SET assignee_id=$1, updated_at=$2
-    WHERE id=$3 AND owner_id=$4        (owner check di level query)
+    WHERE id=$3 AND owner_id=$4        (owner check at query level)
   INSERT INTO task_logs (task_id, actor_id, action='assigned', payload)
 COMMIT
-[notifikasi via interface Notifier — DI LUAR tx, kegagalan tidak meng-rollback assign]
+[notification via the Notifier interface — OUTSIDE the tx, failure does not roll back the assign]
 ```
 
-Rows affected = 0 → rollback → `403 FORBIDDEN` (bukan task-nya, atau bukan owner-nya). Notifikasi dikirim setelah commit — gagal notify hanya jadi warn log, state DB tetap konsisten.
+Rows affected = 0 → rollback → `403 FORBIDDEN` (not your task, or not the owner). The notification is sent after commit — a failed notify is only a warn log; DB state stays consistent.
 
 ## Database Design
 
-Skema ada di [`migrations/000001_init.up.sql`](migrations/000001_init.up.sql) dan di-embed ke binary (fail-fast saat migrasi gagal).
+The schema lives in [`migrations/000001_init.up.sql`](migrations/000001_init.up.sql) and is embedded into the binary (fail-fast when a migration fails).
 
-| Tabel              | Purpose                                                                         |
-|--------------------|---------------------------------------------------------------------------------|
-| `users`            | akun; `email` UNIQUE, `password_hash` bcrypt.                                  |
-| `tasks`            | task milik user; FK `owner_id`; `assignee_id` nullable (FK ke users); status `todo`/`in_progress`/`done`; index untuk filter owner+status, search title, dan lookup assignee. |
-| `task_logs`        | audit trail assignment (ikut transaction assign).                              |
-| `idempotency_keys` | snapshot + expiry untuk idempotent create (`key + user_id` composite PK).       |
+| Table              | Purpose                                                                          |
+|--------------------|----------------------------------------------------------------------------------|
+| `users`            | accounts; `email` UNIQUE, `password_hash` bcrypt.                                |
+| `tasks`            | user-owned tasks; FK `owner_id`; nullable `assignee_id` (FK to users); status `todo`/`in_progress`/`done`; indexes for owner+status filtering, title search, and assignee lookup. |
+| `task_logs`        | assignment audit trail (committed within the assign transaction).                |
+| `idempotency_keys` | snapshot + expiry for idempotent creates (`key + user_id` composite PK).         |
 
-Pragmatik runtime:
+Runtime pragmatics:
 
-- **Connection pool dibatasi** (default 10/4) via config, bukan unlimited.
-- Migrasi **embedded** (`embed.FS`) dan jalan otomatis di startup — binary self-contained, distroless-friendly, tidak butuh `migrate` CLI saat deploy.
+- **Connection pool is bounded** (default 10/4) via config, not unlimited.
+- Migrations are **embedded** (`embed.FS`) and run automatically at startup — the binary is self-contained, distroless-friendly, and needs no `migrate` CLI at deploy time.
 
 ## Testing
 
 ```bash
-make check           # vet + test + build — gate cepet sebelum push
-make test            # = go test ./... (DB-backed test skip kalau tanpa Postgres)
-make test-race       # = go test -race ./... — wajib hijau
-make test-all        # test + race + anti-flaky -count=2 — urutan CI
-go vet ./...         # static check saja
+make check           # vet + test + build — quick gate before push
+make test            # = go test ./... (DB-backed tests skip without Postgres)
+make test-race       # = go test -race ./... — must stay green
+make test-all        # test + race + anti-flaky -count=2 — the CI order
+go vet ./...         # static check only
 ```
 
-Test yang butuh PostgreSQL (repository, infra, dan race suite) otomatis **skip** (bukan fail) kalau `TEST_DB_URL` tidak reachable; set variabel ini untuk menjalankan penuh:
+Tests that need PostgreSQL (repository, infra, and the race suite) automatically **skip** (not fail) when `TEST_DB_URL` is unreachable; set the variable to run them fully:
 
 ```bash
-export TEST_DB_URL=postgres://tm_user:tm_pass@localhost:5432/postgres?sslmode=disable
+export TEST_DB_URL=postgres://tm_user:***@localhost:5432/postgres?sslmode=disable
 go test ./...
 ```
 
 ### Race suite (flagship)
 
-[`internal/api/handler/race_test.go`](internal/api/handler/race_test.go) adalah suite end-to-end: **real HTTP** (fiber listener sungguhan) + **real PostgreSQL** (throwaway database per run, auto-drop). Barrier pattern melepas 50 goroutine bersamaan — tanpa sleep, tanpa jitter, deterministik:
+[`internal/api/handler/race_test.go`](internal/api/handler/race_test.go) is an end-to-end suite: **real HTTP** (a real fiber listener) + **real PostgreSQL** (a throwaway database per run, auto-dropped). A barrier pattern releases 50 goroutines simultaneously — no sleeps, no jitter, deterministic:
 
-| Test                          | Yang dibuktikan                                                                 |
-|-------------------------------|---------------------------------------------------------------------------------|
-| `TestRace_IdempotencySequential` | key sama → 201 + body byte-identical; tepat 1 task + 1 key di DB.             |
-| `TestRace_IdempotencyConcurrent50` | 50 goroutine, 1 key: semua 201, semua body identik, DB tepat 1 task + 1 key. |
-| `TestRace_IdempotencyNegativeControl` | 50 goroutine, 50 key berbeda → 50 task (bukti tidak over-blocking).       |
-| `TestRace_ReplayAfterMutation` | PUT setelah create, lalu replay key lama → snapshot asli, bukan task ter-update. |
-| `TestRace_AuthConcurrent`     | 50 user berbeda → masing-masing tepat 1 task; tidak ada cross-user leak.        |
+| Test                              | What it proves                                                                    |
+|-----------------------------------|-----------------------------------------------------------------------------------|
+| `TestRace_IdempotencySequential`  | same key → 201 + byte-identical body; exactly 1 task + 1 key in the DB.            |
+| `TestRace_IdempotencyConcurrent50`| 50 goroutines, 1 key: all 201, all bodies identical, exactly 1 task + 1 key in DB. |
+| `TestRace_IdempotencyNegativeControl` | 50 goroutines, 50 distinct keys → 50 tasks (proof there is no over-blocking). |
+| `TestRace_ReplayAfterMutation`    | PUT after create, then replay the old key → the original snapshot, not the updated task. |
+| `TestRace_AuthConcurrent`         | 50 distinct users → each gets exactly 1 task; no cross-user leaks.                 |
 
 ```bash
 go test -race -count=2 ./internal/api/handler -run TestRace_
@@ -275,4 +275,4 @@ go test -race -count=2 ./internal/api/handler -run TestRace_
 
 ## License
 
-Belum ditentukan.
+Not yet determined.
